@@ -1,0 +1,14 @@
+node_modules/
+out/
+dist/
+release/
+rust-engine/target/
+coverage/
+*.log
+.DS_Store
+PRD.md
+AI-ROADMAP.md
+*.psq
+renju-*.json
+.vscode/
+.idea/

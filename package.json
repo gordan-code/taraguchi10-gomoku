@@ -1,0 +1,53 @@
+{
+  "name": "renju-master",
+  "version": "1.0.0",
+  "description": "RenjuMaster — 塔拉山口-10 规则连珠（五子棋）AI 桌面应用",
+  "main": "./out/main/index.js",
+  "author": "RenjuMaster",
+  "license": "MIT",
+  "private": true,
+  "build": {
+    "appId": "com.renjumaster.app",
+    "productName": "RenjuMaster",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**/*"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  },
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "test": "vitest run",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json",
+    "package": "electron-vite build && electron-builder --win"
+  },
+  "dependencies": {
+    "onnxruntime-web": "^1.29.0",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "electron": "^33.3.1",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^2.3.0",
+    "onnxruntime-node": "^1.29.0",
+    "typescript": "^5.7.2",
+    "vite": "^5.4.11",
+    "vitest": "^2.1.8",
+    "vue-tsc": "^3.3.11"
+  }
+}
