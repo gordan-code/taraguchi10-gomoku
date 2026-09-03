@@ -1,6 +1,6 @@
 # RenjuMaster 连珠大师
 
-基于**塔拉山口-10（Taraguchi-10）**职业规则的连珠（五子棋）AI 对弈桌面应用（Electron + Vue 3 + TypeScript + Rust/WASM）。
+基于 **塔拉山口-10（Taraguchi-10）**职业规则的连珠（五子棋）AI 对弈桌面应用（Electron + Vue 3 + TypeScript + Rust/WASM）。
 
 ## 功能
 
@@ -81,4 +81,3 @@ node bench.mjs   # 基准回归：堵活三/冲四即胜/活四判负/增量评�
 
 - [RenjuNet 塔拉山口-10 官方规则](https://www.renju.net/rule/25/)
 - [2026 世界连珠团体锦标赛](https://www.renju.net/tournament/3510/)（采用 Taraguchi-10）
-- 详见项目内 `PRD.md`
