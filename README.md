@@ -75,7 +75,7 @@ node bench.mjs   # 基准回归：堵活三/冲四即胜/活四判负/增量评�
 
 ## AI 训练（AlphaZero）
 
-配套的 AlphaZero 训练框架见 `../AlphaZero-Gomoku/`：KataGo 蒸馏数据监督预训练 + 自对弈强化，训练完成的快照导出 ONNX 放入 `src/renderer/src/ai/model.onnx` 供应用内推理。
+配套的 AlphaZero 训练框架见 [AlphaZero-Gomoku-Taraguchi10](https://github.com/gordan-code/AlphaZero-Gomoku-Taraguchi10)：蒸馏数据监督预训练 + 自对弈强化，训练完成的快照导出 ONNX 放入 `src/renderer/src/ai/model.onnx` 供应用内推理。
 
 ## 规则参考
 
