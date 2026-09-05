@@ -385,6 +385,10 @@ function vctWin(board: Board, color: Color, depth: number, budget: { n: number; 
   if (depth <= 0) return -1
   if (++budget.n > VCT_NODE_LIMIT || Date.now() > budget.deadline) return -1
   const opp: Color = color === 1 ? 2 : 1
+  // 对手盘面已有四（存在成五点）时，我方任何「连续威胁取胜」都不成立：
+  // 对手下一手直接成五反杀，VCT 的必胜结论必为假。返回 -1 交给
+  // 一步取胜预检（我方也有四时我先赢）与 Negamax 正常搜索处理。
+  if (hasFourThreat(board, opp)) return -1
   for (const i of threatMoves(board, color)) {
     const p = { x: i % SIZE, y: Math.floor(i / SIZE) }
     board[i] = color

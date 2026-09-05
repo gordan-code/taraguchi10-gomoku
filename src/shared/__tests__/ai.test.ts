@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { AiLevel, Board, Player, Pos, idx } from '../types'
 import { GameState, newGame, applyEvent } from '../fsm'
 import { decideAiAction } from '../ai/opening'
-import { evaluate, searchBestMove, LEVELS, fourWinningPoints, threeFourPoints, dynamicTimeMs, rootCandidates } from '../ai/engine'
+import { evaluate, searchBestMove, probeForcedWin, LEVELS, fourWinningPoints, threeFourPoints, dynamicTimeMs, rootCandidates } from '../ai/engine'
 import { lookupOpeningBook } from '../ai/opening-book'
 import { emptyBoard } from '../board'
 
@@ -53,6 +53,19 @@ describe('搜索', () => {
     expect(
       (r.move!.x === 4 || r.move!.x === 9) && r.move!.y === 5
     ).toBe(true)
+  })
+
+  it('对手已有四时 VCT 探测不得宣称必胜（假胜回归：评测对局曾因此白送两局）', () => {
+    const b = emptyBoard()
+    // 白已成四 (5,5)(6,5)(7,5)(8,5)，成五点 (4,5)/(9,5)；
+    // 黑另有三连 (5,7)(6,7)(7,7) 可冲四——若 VCT 无视白的四会宣称黑必胜
+    for (const [x, y] of [[5, 5], [6, 5], [7, 5], [8, 5]]) b[idx(x, y)] = 2
+    for (const [x, y] of [[5, 7], [6, 7], [7, 7]]) b[idx(x, y)] = 1
+    // 黑无四 → probeForcedWin 必须返回 -1（白下一手成五，黑只能挡）
+    expect(probeForcedWin(b, 1)).toBe(-1)
+    const r = searchBestMove(b, 1, { maxDepth: 8, timeMs: 2000, width: 16, noise: 0 })
+    // 搜索结果必须是挡点（或黑自身成五点，此处黑无四）
+    expect((r.move!.x === 4 || r.move!.x === 9) && r.move!.y === 5).toBe(true)
   })
 
   it('黑方不会选择禁手点', () => {

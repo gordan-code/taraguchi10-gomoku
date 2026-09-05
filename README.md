@@ -36,10 +36,23 @@ npm run package    # 打包 Windows 安装包（release/）
 cd rust-engine
 cargo build --release --target wasm32-unknown-unknown
 cp target/wasm32-unknown-unknown/release/renju_engine.wasm ../src/renderer/src/ai/renju_engine.wasm
-node bench.mjs   # 基准回归：堵活三/冲四即胜/活四判负/增量评估一致性
+node bench.mjs   # 基准回归：堵活三/冲四即胜/活四判负/增量评估与四表一致性
 ```
 
 （需要 `rustup target add wasm32-unknown-unknown`。`src/renderer/src/ai/` 下已放置编译产物，不装 Rust 也能正常开发运行。）
+
+### 引擎对打评测
+
+`scripts/eval.mjs` 是固定时间控制的引擎对打框架（TS 引擎经 esbuild 打包进 Node，WASM 直接加载），用于度量任何内核/参数改动的棋力影响：
+
+```bash
+node scripts/eval.mjs --engine-a ts --engine-b wasm --games 12 --time 500   # 基线对比
+node scripts/eval.mjs --engine-a wasm --engine-b wasm \
+  --wasm-a <旧内核.wasm> --wasm-b <新内核.wasm> --games 24                  # 新旧内核 A/B
+node scripts/eval.mjs --engine-a ts --engine-b wasm --games 1 --dump        # 复盘单局着法+终盘
+```
+
+输出胜/负/和、得分率与 Elo 估计、平均深度/威胁线深度/节点率。判定：黑恰好五连胜、白 ≥五连胜、黑禁手即负；着法上限后按最后评估分裁决。种子化开局可复现，先后手轮换。
 
 ## 架构
 

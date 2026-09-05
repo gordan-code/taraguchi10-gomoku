@@ -18,12 +18,13 @@ function run(label, color, timeMs) {
   const x = mv % 15
   const y = Math.floor(mv / 15)
   const cons = e.eval_consistency()
+  const fcons = e.five_consistency()
   console.log(
     `${label}: move=(${x},${y}) score=${e.get_score()} depth=${e.get_depth()} ` +
       `seldepth=${e.get_seldepth()} nodes=${e.get_nodes()} timedOut=${e.get_timed_out()} ` +
-      `elapsed=${ms}ms evalConsistency=${cons}`
+      `elapsed=${ms}ms evalConsistency=${cons} fiveConsistency=${fcons}`
   )
-  return { x, y, score: e.get_score(), depth: e.get_depth(), nodes: e.get_nodes(), cons }
+  return { x, y, score: e.get_score(), depth: e.get_depth(), nodes: e.get_nodes(), cons, fcons }
 }
 
 // ---- 场景 1：白活三，黑必须堵（r=7 行 c=6..8 三连白，两端 5/9 空）
@@ -67,6 +68,7 @@ set([
 ])
 const r3 = run('中盘(1s) ', 1, 1000)
 
-const ok = blocked && winNow && lostCorrect && r1.cons === 0 && r2.cons === 0 && r3.cons === 0
+const ok = blocked && winNow && lostCorrect && r1.cons === 0 && r2.cons === 0 && r3.cons === 0 &&
+  r1.fcons === 0 && r2.fcons === 0 && r3.fcons === 0
 console.log(ok ? '✅ 全部通过' : '❌ 有失败项')
 process.exit(ok ? 0 : 1)
