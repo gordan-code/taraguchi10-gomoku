@@ -13,6 +13,11 @@ const BLACK: u8 = 1;
 const WHITE: u8 = 2;
 const MATE: i32 = 1_000_000;
 const INF: i32 = 1_000_000_000;
+/// 叶节点 VCF 静态延伸的攻击手预算。0 = 关闭。
+/// A/B 实测（scripts/eval.mjs，16 局 400ms）：QMAX=6 时 7:9、QMAX=3 时 6:10
+/// 均负于关闭——强制挡点机制本就精确解析进行中的四战，成四延伸的边际收益
+/// 抵不上主搜索深度损失（5.2→4.5）。长时控（≥2s）下可重启实验。
+const VCF_QMAX: i32 = 0;
 
 const DIRS: [(i32, i32); 4] = [(1, 0), (0, 1), (1, 1), (1, -1)]; // (dx, dy)
 const W: [i32; 6] = [0, 2, 24, 320, 3600, 1_000_000];
@@ -89,6 +94,14 @@ static mut FIVE_W_MASK: [u64; 4] = [0; 4];
 /** 上表的非零格数（0 = 无任何四威胁，节点入口可跳过细扫） */
 static mut FIVE_B_CELLS: i32 = 0;
 static mut FIVE_W_CELLS: i32 = 0;
+/** 成四点表：F3_X[i] = 经过 i 的（3 子 X + 2 空）窗口数——在 i 落子即成四。
+ *  叶节点 VCF 静态延伸的入口：己方成四手是强制手（对手必须挡五点）。 */
+static mut F3_B: [i16; N] = [0; N];
+static mut F3_W: [i16; N] = [0; N];
+static mut F3_B_MASK: [u64; 4] = [0; 4];
+static mut F3_W_MASK: [u64; 4] = [0; 4];
+static mut F3_B_CELLS: i32 = 0;
+static mut F3_W_CELLS: i32 = 0;
 
 static mut RESULT_SCORE: i32 = 0;
 static mut RESULT_DEPTH: i32 = 0;
@@ -129,7 +142,7 @@ pub extern "C" fn eval_consistency() -> i32 {
 pub extern "C" fn get_seldepth() -> i32 {
     unsafe { MAX_PLY }
 }
-/** 调试：四威胁表与全盘重算的不一致格数（0 = 一致）。搜索结束后调用。 */
+/** 调试：四威胁/成四点表与全盘重算的不一致格数（0 = 一致）。搜索结束后调用。 */
 #[no_mangle]
 pub extern "C" fn five_consistency() -> i32 {
     unsafe {
@@ -137,15 +150,25 @@ pub extern "C" fn five_consistency() -> i32 {
         let w = FIVE_W;
         let bc = FIVE_B_CELLS;
         let wc = FIVE_W_CELLS;
+        let b3 = F3_B;
+        let w3 = F3_W;
+        let bc3 = F3_B_CELLS;
+        let wc3 = F3_W_CELLS;
         build_five_tables();
         let mut bad = 0i32;
         for i in 0..N {
             if FIVE_B[i] != b[i] || FIVE_W[i] != w[i] {
                 bad += 1;
             }
+            if F3_B[i] != b3[i] || F3_W[i] != w3[i] {
+                bad += 10000;
+            }
         }
         if FIVE_B_CELLS != bc || FIVE_W_CELLS != wc {
             bad += 1000;
+        }
+        if F3_B_CELLS != bc3 || F3_W_CELLS != wc3 {
+            bad += 1000_000;
         }
         bad
     }
@@ -536,8 +559,10 @@ fn eval_delta(r: i32, c: i32, prev: u8) {
                 let mut old_w = 0;
                 let mut new_b = 0;
                 let mut new_w = 0;
-                let mut old_empty: i32 = -1;
-                let mut new_empty: i32 = -1;
+                let mut old_e1: i32 = -1;
+                let mut old_e2: i32 = -1;
+                let mut new_e1: i32 = -1;
+                let mut new_e2: i32 = -1;
                 for k in 0..5i32 {
                     let kr = sr + dy * k;
                     let kc = sc + dx * k;
@@ -549,30 +574,59 @@ fn eval_delta(r: i32, c: i32, prev: u8) {
                         old_b += 1;
                     } else if v_old == WHITE {
                         old_w += 1;
+                    } else if old_e1 < 0 {
+                        old_e1 = ki;
                     } else {
-                        old_empty = ki;
+                        old_e2 = ki;
                     }
                     if v_new == BLACK {
                         new_b += 1;
                     } else if v_new == WHITE {
                         new_w += 1;
+                    } else if new_e1 < 0 {
+                        new_e1 = ki;
                     } else {
-                        new_empty = ki;
+                        new_e2 = ki;
                     }
                 }
                 delta += window_contribution(new_b, new_w) - window_contribution(old_b, old_w);
                 // 四威胁表增量：窗口恰好 4 子 + 1 空 → 空点是成五点
                 if old_b == 4 && old_w == 0 {
-                    five_dec(BLACK, old_empty as usize);
+                    five_dec(BLACK, old_e1 as usize);
                 }
                 if new_b == 4 && new_w == 0 {
-                    five_inc(BLACK, new_empty as usize);
+                    five_inc(BLACK, new_e1 as usize);
                 }
                 if old_w == 4 && old_b == 0 {
-                    five_dec(WHITE, old_empty as usize);
+                    five_dec(WHITE, old_e1 as usize);
                 }
                 if new_w == 4 && new_b == 0 {
-                    five_inc(WHITE, new_empty as usize);
+                    five_inc(WHITE, new_e1 as usize);
+                }
+                // 成四点表增量：窗口恰好 3 子 + 2 空 → 两个空点都是成四点
+                if old_b == 3 && old_w == 0 {
+                    f3_dec(BLACK, old_e1 as usize);
+                    if old_e2 >= 0 {
+                        f3_dec(BLACK, old_e2 as usize);
+                    }
+                }
+                if new_b == 3 && new_w == 0 {
+                    f3_inc(BLACK, new_e1 as usize);
+                    if new_e2 >= 0 {
+                        f3_inc(BLACK, new_e2 as usize);
+                    }
+                }
+                if old_w == 3 && old_b == 0 {
+                    f3_dec(WHITE, old_e1 as usize);
+                    if old_e2 >= 0 {
+                        f3_dec(WHITE, old_e2 as usize);
+                    }
+                }
+                if new_w == 3 && new_b == 0 {
+                    f3_inc(WHITE, new_e1 as usize);
+                    if new_e2 >= 0 {
+                        f3_inc(WHITE, new_e2 as usize);
+                    }
                 }
             }
         }
@@ -616,6 +670,53 @@ fn five_dec(color: u8, e: usize) {
     }
 }
 
+fn f3_inc(color: u8, e: usize) {
+    unsafe {
+        if color == BLACK {
+            F3_B[e] += 1;
+            if F3_B[e] == 1 {
+                F3_B_CELLS += 1;
+                F3_B_MASK[e >> 6] |= 1u64 << (e & 63);
+            }
+        } else {
+            F3_W[e] += 1;
+            if F3_W[e] == 1 {
+                F3_W_CELLS += 1;
+                F3_W_MASK[e >> 6] |= 1u64 << (e & 63);
+            }
+        }
+    }
+}
+
+fn f3_dec(color: u8, e: usize) {
+    unsafe {
+        if color == BLACK {
+            F3_B[e] -= 1;
+            if F3_B[e] == 0 {
+                F3_B_CELLS -= 1;
+                F3_B_MASK[e >> 6] &= !(1u64 << (e & 63));
+            }
+        } else {
+            F3_W[e] -= 1;
+            if F3_W[e] == 0 {
+                F3_W_CELLS -= 1;
+                F3_W_MASK[e >> 6] &= !(1u64 << (e & 63));
+            }
+        }
+    }
+}
+
+/** 增量总分的行棋方视角值（正 = 当前行棋方优） */
+fn eval_side(color: u8) -> i32 {
+    unsafe {
+        if color == BLACK {
+            EVAL_SCORE
+        } else {
+            -EVAL_SCORE
+        }
+    }
+}
+
 /** 掩码迭代：产出 mask 中所有成五点（cell index）。 */
 struct FiveIter {
     mask: [u64; 4],
@@ -647,7 +748,7 @@ impl FiveIter {
     }
 }
 
-/** 从空表全量重建四威胁表（search_best_move 入口一次性调用） */
+/** 从空表全量重建四威胁/成四点表（search_best_move 入口一次性调用） */
 fn build_five_tables() {
     unsafe {
         FIVE_B = [0; N];
@@ -656,6 +757,12 @@ fn build_five_tables() {
         FIVE_W_MASK = [0; 4];
         FIVE_B_CELLS = 0;
         FIVE_W_CELLS = 0;
+        F3_B = [0; N];
+        F3_W = [0; N];
+        F3_B_MASK = [0; 4];
+        F3_W_MASK = [0; 4];
+        F3_B_CELLS = 0;
+        F3_W_CELLS = 0;
         // 与 evaluate() 相同的四个窗口族
         for r in 0..SIZE {
             for c in 0..(SIZE - 4) {
@@ -680,27 +787,42 @@ fn build_five_tables() {
     }
 }
 
-/// 统计起点 (r,c)、步长 (dy,dx) 的 5 连窗口：恰好 4 子 + 1 空则空点记为成五点
+/// 统计起点 (r,c)、步长 (dy,dx) 的 5 连窗口：4+1 空记成五点，3+2 空记成四点
 fn count_window_five(r: i32, c: i32, dy: i32, dx: i32) {
     unsafe {
         let mut b = 0;
         let mut w = 0;
-        let mut empty: i32 = -1;
+        let mut e1: i32 = -1;
+        let mut e2: i32 = -1;
         for k in 0..5i32 {
             let v = BOARD[idx(r + dy * k, c + dx * k)];
             if v == BLACK {
                 b += 1;
             } else if v == WHITE {
                 w += 1;
+            } else if e1 < 0 {
+                e1 = idx(r + dy * k, c + dx * k) as i32;
             } else {
-                empty = idx(r + dy * k, c + dx * k) as i32;
+                e2 = idx(r + dy * k, c + dx * k) as i32;
             }
         }
         if b == 4 && w == 0 {
-            five_inc(BLACK, empty as usize);
+            five_inc(BLACK, e1 as usize);
         }
         if w == 4 && b == 0 {
-            five_inc(WHITE, empty as usize);
+            five_inc(WHITE, e1 as usize);
+        }
+        if b == 3 && w == 0 {
+            f3_inc(BLACK, e1 as usize);
+            if e2 >= 0 {
+                f3_inc(BLACK, e2 as usize);
+            }
+        }
+        if w == 3 && b == 0 {
+            f3_inc(WHITE, e1 as usize);
+            if e2 >= 0 {
+                f3_inc(WHITE, e2 as usize);
+            }
         }
     }
 }
@@ -1008,9 +1130,64 @@ fn negamax(color: u8, depth: i32, alpha: i32, beta: i32, ply: i32) -> i32 {
         }
     }
 
-    if depth == 0 {
-        let e = unsafe { EVAL_SCORE };
-        return if color == BLACK { e } else { -e };
+    if depth <= 0 {
+        // ---- VCF 静态延伸（quiescence）----
+        // 叶节点上己方「成四手」（三→四）是强制手：对手必须挡五点，否则成五。
+        // 只延伸成四手并让强制挡点机制接力，冲四连招（VCF）在叶节点精确解析，
+        // 消除地平线截断误差。链值与静态评估取 max（stand-pat）。
+        // depth 负数计_VCF_QMAX 为攻击手预算，防止攻击树无界爆炸。
+        let my_f3_cells = unsafe { if color == BLACK { F3_B_CELLS } else { F3_W_CELLS } };
+        if my_f3_cells == 0 || depth <= -VCF_QMAX {
+            let e = unsafe { EVAL_SCORE };
+            return if color == BLACK { e } else { -e };
+        }
+        let stand = eval_side(color);
+        let mut best = stand;
+        let mut a = alpha;
+        let mut tried = 0usize;
+        unsafe {
+            let mask = if color == BLACK { F3_B_MASK } else { F3_W_MASK };
+            let mut it = FiveIter { mask, w: 0, bits: 0 };
+            while tried < 2 {
+                let i = match it.next_cell() {
+                    Some(i) => i,
+                    None => break,
+                };
+                if BOARD[i] != 0 {
+                    continue;
+                }
+                let r = (i / 15) as i32;
+                let c = (i % 15) as i32;
+                if color == BLACK {
+                    BOARD[i] = BLACK;
+                    let forbidden = check_forbidden(&BOARD, r, c, 0);
+                    BOARD[i] = 0;
+                    if forbidden {
+                        continue;
+                    }
+                }
+                tried += 1;
+                BOARD[i] = color;
+                HASH ^= zobrist_at(i, color);
+                eval_delta(r, c, 0);
+                near_delta(r, c, 1);
+                let val = -negamax(opp, depth - 1, -beta, -a, ply + 1);
+                near_delta(r, c, -1);
+                HASH ^= zobrist_at(i, color);
+                BOARD[i] = 0;
+                eval_delta(r, c, color);
+                if val > best {
+                    best = val;
+                }
+                if val > a {
+                    a = val;
+                }
+                if a >= beta {
+                    break;
+                }
+            }
+        }
+        return best;
     }
 
     // 内部宽度 16：α-β 的有效分支约 √width，从 24 收窄到 16 节点数约降 5 倍；
