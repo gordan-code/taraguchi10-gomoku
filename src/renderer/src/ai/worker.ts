@@ -81,9 +81,10 @@ self.onmessage = async (e: MessageEvent<AiRequest>) => {
       const t0 = Date.now()
       const color: Color = req.state.moves.length % 2 === 0 ? 1 : 2
       const timeMs = Math.min(3000, Math.max(800, dynamicTimeMs(req.state.board, color, 2000)))
-      const nn =
-        (await nnMctsPickMove(req.state, { timeMs, sims: 384 }).catch(() => null)) ??
-        (await nnPickPlayMove(req.state))
+      // 单树 MCTS 为默认：根并行（多 Worker 独立噪声树）经对打实测不优于单树
+      // （原生 9:7、浏览器机制 6:6 vs 单树 7:5/12:4），独立树重复劳动 + 噪声稀释。
+      // 并行基础设施保留在 nnSession.nnParallelPickMove，供后续实验启用。
+      const nn = (await nnMctsPickMove(req.state, { timeMs, sims: 384 }).catch(() => null)) ?? (await nnPickPlayMove(req.state))
       if (nn) {
         // NN 路径不走 decideAiAction 的统一计时，这里单独记录耗时
         nn.report.elapsedMs = Date.now() - t0

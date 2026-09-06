@@ -31,6 +31,16 @@ export interface MctsOptions {
   deadline: number
   /** PUCT 探索系数（默认 1.25） */
   cpuct?: number
+  /** 根先验 Dirichlet 噪声（并行多树时提供多样性；同一 seed 可复现） */
+  rootNoise?: { eps: number; alpha: number; seed: number }
+}
+
+export interface MctsVisit {
+  /** 根合法手 cell index（y*15+x） */
+  i: number
+  n: number
+  /** 该子节点价值（根行棋方视角），未访问为 0 */
+  q: number
 }
 
 export interface MctsResult {
@@ -43,6 +53,111 @@ export interface MctsResult {
   depth: number
   /** 访问次数前 3 的着法（调试/展示用） */
   top: Array<{ pos: Pos; n: number }>
+  /** 根全部合法手的访问明细（并行多树汇总用） */
+  visits: MctsVisit[]
+}
+
+/**
+ * 并行多树汇总（根并行 MCTS）：各树根访问次数按 cell 求和，选访问最多的着法；
+ * 价值取各树对该着法价值的加权平均。
+ */
+export function combineMctsResults(results: Array<MctsResult | null>): MctsResult | null {
+  const valid = results.filter((r): r is MctsResult => r !== null)
+  if (valid.length === 0) return null
+  if (valid.length === 1) return valid[0]
+  const sum = new Map<number, { n: number; wq: number }>()
+  let totalSims = 0
+  let maxDepth = 0
+  for (const r of valid) {
+    totalSims += r.sims
+    if (r.depth > maxDepth) maxDepth = r.depth
+    for (const v of r.visits) {
+      const e = sum.get(v.i) ?? { n: 0, wq: 0 }
+      e.n += v.n
+      e.wq += v.q * v.n
+      sum.set(v.i, e)
+    }
+  }
+  let bestI = -1
+  let bestN = -1
+  let bestQ = 0
+  for (const [i, e] of sum) {
+    if (e.n > bestN) {
+      bestN = e.n
+      bestI = i
+      bestQ = e.n > 0 ? e.wq / e.n : 0
+    }
+  }
+  if (bestI < 0) return null
+  const visits: MctsVisit[] = [...sum.entries()]
+    .map(([i, e]) => ({ i, n: e.n, q: e.n > 0 ? e.wq / e.n : 0 }))
+    .sort((a, b) => b.n - a.n)
+  const posOf = (i: number): Pos => ({ x: i % SIZE, y: Math.floor(i / SIZE) })
+  return {
+    pos: posOf(bestI),
+    q: bestQ,
+    sims: totalSims,
+    depth: maxDepth,
+    top: visits.slice(0, 3).map((v) => ({ pos: posOf(v.i), n: v.n })),
+    visits
+  }
+}
+
+// ---------------------------------------------------------------- 种子化随机（根噪声）
+
+/** mulberry32 种子随机：并行各树用不同 seed，同一 seed 可复现 */
+function makeRng(seed: number): () => number {
+  let a = seed >>> 0
+  return () => {
+    a |= 0
+    a = (a + 0x6d2b79f5) | 0
+    let t = Math.imul(a ^ (a >>> 15), 1 | a)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+/** Box-Muller 标准正态 */
+function normalRng(rng: () => number): number {
+  let u = 0
+  let v = 0
+  while (u === 0) u = rng()
+  while (v === 0) v = rng()
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v)
+}
+
+/** Marsaglia-Tsang Gamma 采样（alpha > 0） */
+function gammaRng(rng: () => number, alpha: number): number {
+  if (alpha < 1) {
+    return gammaRng(rng, alpha + 1) * Math.pow(rng(), 1 / alpha)
+  }
+  const d = alpha - 1 / 3
+  const c = 1 / Math.sqrt(9 * d)
+  for (;;) {
+    const x = normalRng(rng)
+    const v = 1 + c * x
+    if (v <= 0) continue
+    const v3 = v * v * v
+    const u = rng()
+    if (u < 1 - 0.0331 * x * x * x * x) return d * v3
+    if (Math.log(u) < 0.5 * x * x + d * (1 - v3 + Math.log(v3))) return d * v3
+  }
+}
+
+/** Dirichlet(alpha, k)：k 个正分量，和为 1 */
+function dirichlet(rng: () => number, alpha: number, k: number): Float32Array {
+  const out = new Float32Array(k)
+  let sum = 0
+  for (let i = 0; i < k; i++) {
+    out[i] = gammaRng(rng, alpha)
+    sum += out[i]
+  }
+  if (sum <= 0) {
+    out.fill(1 / k)
+    return out
+  }
+  for (let i = 0; i < k; i++) out[i] /= sum
+  return out
 }
 
 interface MctsNode {
@@ -131,7 +246,8 @@ export async function mctsSearch(
         q: 1,
         sims: 0,
         depth: 1,
-        top: [{ pos: { x: i % SIZE, y: Math.floor(i / SIZE) }, n: 1 }]
+        top: [{ pos: { x: i % SIZE, y: Math.floor(i / SIZE) }, n: 1 }],
+        visits: [{ i, n: 1, q: 1 }]
       }
     }
   }
@@ -225,12 +341,20 @@ export async function mctsSearch(
         backup(node, node.terminalValue)
         return
       }
-      const logits: number[] = []
-      for (const i of legal) logits.push(policy[i] ?? 0)
-      node.priors = softmax(logits)
-      node.legal = legal
-      node.children = new Array(legal.length).fill(null)
-      backup(node, value)
+    const logits: number[] = []
+    for (const i of legal) logits.push(policy[i] ?? 0)
+    node.priors = softmax(logits)
+    // 根先验噪声：并行多树的多样性来源（仅根展开时施加）
+    if (node === root && opts.rootNoise) {
+      const rng = makeRng(opts.rootNoise.seed)
+      const noise = dirichlet(rng, opts.rootNoise.alpha, node.priors.length)
+      for (let k = 0; k < node.priors.length; k++) {
+        node.priors[k] = (1 - opts.rootNoise.eps) * node.priors[k] + opts.rootNoise.eps * noise[k]
+      }
+    }
+    node.legal = legal
+    node.children = new Array(legal.length).fill(null)
+    backup(node, value)
     } finally {
       unwind()
     }
@@ -258,17 +382,23 @@ export async function mctsSearch(
   if (bestK < 0) return null
   const bestChild = root.children[bestK]
   const q = bestChild && bestChild.n > 0 ? bestChild.w / bestChild.n : 0
-  const top = root.legal
-    .map((i, k) => ({ i, n: root.children[k] ? root.children[k]!.n : 0 }))
+  const visits: MctsVisit[] = root.legal.map((i, k) => {
+    const c = root.children[k]
+    return { i, n: c ? c.n : 0, q: c && c.n > 0 ? c.w / c.n : 0 }
+  })
+  const posOf = (i: number): Pos => ({ x: i % SIZE, y: Math.floor(i / SIZE) })
+  const top = visits
+    .slice()
     .sort((a, b) => b.n - a.n)
     .slice(0, 3)
-    .map(({ i, n }) => ({ pos: { x: i % SIZE, y: Math.floor(i / SIZE) }, n }))
+    .map((v) => ({ pos: posOf(v.i), n: v.n }))
 
   return {
     pos: { x: root.legal[bestK] % SIZE, y: Math.floor(root.legal[bestK] / SIZE) },
     q,
     sims: done,
     depth: maxDepth,
-    top
+    top,
+    visits
   }
 }

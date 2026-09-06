@@ -60,7 +60,7 @@ export { searchBestMove, probeForcedWin, candidateMoves, dynamicTimeMs } from ${
 export { checkForbidden } from ${JSON.stringify(abs('src/shared/forbidden.ts'))}
 export { emptyBoard, runLength } from ${JSON.stringify(abs('src/shared/board.ts'))}
 export { SIZE } from ${JSON.stringify(abs('src/shared/types.ts'))}
-export { mctsSearch } from ${JSON.stringify(abs('src/shared/ai/mcts.ts'))}
+export { mctsSearch, combineMctsResults } from ${JSON.stringify(abs('src/shared/ai/mcts.ts'))}
 export { encodeNnState } from ${JSON.stringify(abs('src/shared/ai/nn.ts'))}
 `
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'renju-eval-'))
@@ -231,29 +231,89 @@ async function playGame(adapters, blackIdx, opening, cfg) {
 
 const { mod, dir } = await bundleTsEngine()
 mod_ = mod
+let nnWorkerCacheDir = null
 
 // A/B 各自独立的 WASM 实例（同文件也各起一份，互不串状态）
-async function makeNnAdapter(mod, label, cfg) {
-  // Node 侧用 onnxruntime-node（原生、快），与浏览器 onnxruntime-web 共享 mctsSearch 逻辑
+async function makeNnAdapter(mod, label, cfg, tmpDir) {
+  // 与生产架构一致：K 个 Worker 线程各自独立会话 + 独立树（根噪声多样性），主线程汇总。
+  // nn-delay 模拟浏览器推理延迟（onnxruntime-web ~20-40ms/次），
+  // 在延迟约束机制下根并行的 K 倍模拟才有意义（Node 原生 ~0.4ms/次时单树更优）。
+  const { Worker } = await import('node:worker_threads')
   const ort = await import('onnxruntime-node')
   const modelPath = path.resolve('src/renderer/src/ai/model.onnx')
-  const sess = await ort.InferenceSession.create(modelPath)
-  let movesCount = cfg.openingPly // pick 时为已落子数（净调用时 + ply）
+  // 预热一个会话确认模型可用（各 Worker 线程内各自再建）
+  await ort.InferenceSession.create(modelPath)
+  const k = Math.max(1, Math.min(Number(arg('nn-threads', 4)), 16))
+  const netDelayMs = Number(arg('nn-delay', 0))
+  // 入口须在项目内（bare 导入 onnxruntime-node 要能解析到 node_modules）
+  const cacheDir = path.join(process.cwd(), 'node_modules', '.eval-cache')
+  fs.mkdirSync(cacheDir, { recursive: true })
+  const entryPath = path.join(cacheDir, 'nn-worker.mjs')
+  fs.writeFileSync(
+    entryPath,
+    `import { parentPort } from 'node:worker_threads'
+import { mctsSearch, encodeNnState } from ${JSON.stringify(pathToFileURL(path.join(tmpDir, 'engine.mjs')).href)}
+let sess = null
+async function getSession() {
+  if (!sess) {
+    const ort = await import('onnxruntime-node')
+    sess = await ort.InferenceSession.create(${JSON.stringify(modelPath)})
+  }
+  return sess
+}
+parentPort.on('message', async (req) => {
+  try {
+    const s = await getSession()
+    const ort = await import('onnxruntime-node')
+    const net = async (b, c, ply) => {
+      if (req.netDelayMs > 0) await new Promise((r) => setTimeout(r, req.netDelayMs))
+      const enc = encodeNnState(b, c, c === 1 && req.movesCount + ply >= 5)
+      const out = await s.run({ input: new ort.Tensor('float32', enc, [1, 4, 15, 15]) })
+      return { policy: out.policy.data, value: out.value.data[0] }
+    }
+    const r = await mctsSearch(req.board, req.color, {
+      sims: req.sims,
+      deadline: Date.now() + req.timeMs,
+      rootNoise: req.noise
+    }, net)
+    parentPort.postMessage({ id: req.id, ok: true, result: r })
+  } catch (err) {
+    parentPort.postMessage({ id: req.id, ok: false, error: String(err) })
+  }
+})
+`
+  )
+  const workers = Array.from({ length: k }, () => new Worker(entryPath))
+  nnWorkerCacheDir = cacheDir
+  let movesCount = cfg.openingPly
   return {
-    label,
+    label: k > 1 ? `${label}×${k}${netDelayMs ? `@${netDelayMs}ms` : ''}` : label,
     async pick(board, color, timeMs) {
       const m0 = movesCount
-      const r = await mod.mctsSearch(
-        board,
-        color,
-        { sims: 1500, deadline: Date.now() + Math.max(300, timeMs) },
-        async (b, c, ply) => {
-          const enc = mod.encodeNnState(b, c, c === 1 && m0 + ply >= 5)
-          const out = await sess.run({ input: new ort.Tensor('float32', enc, [1, 4, 15, 15]) })
-          return { policy: out.policy.data, value: out.value.data[0] }
-        }
+      const sims = 1500
+      const jobs = workers.map((w, t) =>
+        new Promise((resolve) => {
+          const id = `${t}-${Date.now()}-${Math.random()}`
+          const timer = setTimeout(() => resolve(null), timeMs + 10000)
+          w.once(`done-${id}`, (msg) => {
+            clearTimeout(timer)
+            resolve(msg && msg.ok ? msg.result : null)
+          })
+          const onMsg = (msg) => {
+            if (msg.id !== id) return
+            w.off('message', onMsg)
+            w.emit(`done-${id}`, msg)
+          }
+          w.on('message', onMsg)
+          w.postMessage({
+            id, board, color, movesCount: m0, timeMs: Math.max(300, timeMs), sims,
+            netDelayMs, noise: { eps: 0.15, alpha: 1.0, seed: Date.now() ^ (t * 0x9e3779b9) }
+          })
+        })
       )
+      const results = await Promise.all(jobs)
       movesCount++
+      const r = mod.combineMctsResults(results)
       if (!r) return { pos: null, score: 0, depth: 0, seldepth: 0, nodes: 0 }
       return {
         pos: r.pos,
@@ -274,7 +334,7 @@ async function buildAdapters() {
   ]) {
     if (kind === 'ts') out.push(makeTsAdapter(mod, label, cfg))
     else if (kind === 'wasm') out.push(await makeWasmAdapter(mod, label, cfg[wasmKey], cfg))
-    else if (kind === 'nn') out.push(await makeNnAdapter(mod, label, cfg))
+    else if (kind === 'nn') out.push(await makeNnAdapter(mod, label, cfg, dir))
     else throw new Error(`未知引擎类型: ${kind}`)
   }
   return out
@@ -356,5 +416,8 @@ function line(label, kind, acc) {
   return `${label.padEnd(14)} 深度 ${String(avgD).padStart(5)}  威胁线 ${String(avgS).padStart(5)}  节点/手 ${String(avgN).padStart(8)}  ${String(nps).padStart(9)} nps  ${mps.toFixed(0)} ms/手`
 }
 console.log('\n' + line(`A(${cfg.engineA})`, cfg.engineA, statAcc[0] ?? { moves: 0, nodes: 0, elapsedMs: 0, depth: 0, seldepth: 0 }))
-console.log(line(`B(${cfg.engineB})`, cfg.engineB, statAcc[1] ?? { moves: 0, nodes: 0, elapsedMs: 0, depth: 0, seldepth: 0 }))
-fs.rmSync(dir, { recursive: true, force: true })
+  console.log(line(`B(${cfg.engineB})`, cfg.engineB, statAcc[1] ?? { moves: 0, nodes: 0, elapsedMs: 0, depth: 0, seldepth: 0 }))
+try { fs.rmSync(dir, { recursive: true, force: true }) } catch {}
+if (nnWorkerCacheDir) { try { fs.rmSync(nnWorkerCacheDir, { recursive: true, force: true }) } catch {} }
+// worker_threads 不终止会吊住事件循环，CLI 评测直接退出
+process.exit(0)

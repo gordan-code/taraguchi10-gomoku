@@ -5,7 +5,9 @@
  */
 import type { InferenceSession } from 'onnxruntime-web'
 import { encodeNnState, pickMoveFromPolicy } from '@shared/ai/nn'
-import { mctsSearch } from '@shared/ai/mcts'
+import { mctsSearch, combineMctsResults } from '@shared/ai/mcts'
+import type { MctsResult } from '@shared/ai/mcts'
+import type { NnSearchRequest, NnSearchResponse } from './nnSearchWorker'
 import { GameState } from '@shared/fsm'
 import { Color, Pos } from '@shared/types'
 import { AiReport } from '@shared/ai/report'
@@ -21,6 +23,13 @@ async function loadSession(): Promise<InferenceSession | null> {
         // onnxruntime-web 的 wasm 二进制默认在 Electron app:// 下解析不到，
         // 这里显式指向 CDN。离线部署时改为本地打包的 wasm 路径即可。
         ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/'
+        // 多线程 WASM 后端：需要 cross-origin isolation 才生效，无隔离时静默回退单线程
+        try {
+          const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4
+          ort.env.wasm.numThreads = Math.max(1, Math.min(4, cores - 1))
+        } catch {
+          /* 环境不支持则保持默认 */
+        }
         console.log('[nn] 正在加载模型:', modelUrl)
         const sess = await ort.InferenceSession.create(modelUrl, { executionProviders: ['wasm'] })
         console.log('[nn] ONNX 模型加载成功:', modelUrl)
@@ -73,30 +82,116 @@ export async function nnMctsPickMove(state: GameState, opts: NnMctsOptions): Pro
       net
     )
     if (!r) return null
-    const elapsedMs = Date.now() - t0
-    const side = myColor === 1 ? '黑' : '白'
-    const qText = (r.q >= 0 ? '+' : '') + r.q.toFixed(2)
-    const topText = r.top.map((t) => `${t.pos.x + 1},${t.pos.y + 1}(${t.n})`).join(' ')
-    return {
-      pos: r.pos,
-      reason: `神经网络+MCTS（${side}）根价值 ${qText}，${r.sims} 次模拟 / 树深 ${r.depth}，主变访问 ${topText}`,
-      report: {
-        engine: 'neural',
-        score: myColor === 1 ? r.q : -r.q, // 统一为黑方视角
-        depth: r.depth,
-        nodes: r.sims,
-        extra: {
-          引擎: 'NN+MCTS',
-          模拟次数: r.sims,
-          树深: r.depth,
-          根价值: Number(r.q.toFixed(3))
-        }
-      }
-    }
+    return mctsResultToMove(r, myColor, 1)
   } catch (err) {
     console.warn('[nn] MCTS 搜索失败，回退单次策略：', err)
     return null
   }
+}
+
+function mctsResultToMove(r: MctsResult, myColor: Color, workers: number): NnMoveResult {
+  const side = myColor === 1 ? '黑' : '白'
+  const qText = (r.q >= 0 ? '+' : '') + r.q.toFixed(2)
+  const topText = r.top.map((t) => `${t.pos.x + 1},${t.pos.y + 1}(${t.n})`).join(' ')
+  return {
+    pos: r.pos,
+    reason: `神经网络+MCTS（${side}）根价值 ${qText}，${r.sims} 次模拟 / 树深 ${r.depth}，主变访问 ${topText}`,
+    report: {
+      engine: 'neural',
+      score: myColor === 1 ? r.q : -r.q, // 统一为黑方视角
+      depth: r.depth,
+      nodes: r.sims,
+      extra: {
+        引擎: workers > 1 ? 'NN+MCTS×并行' : 'NN+MCTS',
+        模拟次数: r.sims,
+        树深: r.depth,
+        根价值: Number(r.q.toFixed(3)),
+        ...(workers > 1 ? { 并行Workers: workers } : {})
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------- 根并行（多 Worker 多树）
+
+interface PoolEntry {
+  worker: Worker
+  nextId: number
+}
+
+let pool: PoolEntry[] = []
+let poolRequestId = 0
+
+function ensurePool(k: number): number {
+  while (pool.length < k) {
+    try {
+      const worker = new Worker(new URL('./nnSearchWorker.ts', import.meta.url), { type: 'module' })
+      pool.push({ worker, nextId: 1 })
+    } catch (err) {
+      console.warn('[nn] 并行 Worker 创建失败，退化为单树：', err)
+      break
+    }
+  }
+  return pool.length
+}
+
+function requestSearch(
+  entry: PoolEntry,
+  req: Omit<NnSearchRequest, 'id'>
+): Promise<MctsResult | null> {
+  return new Promise((resolve) => {
+    const id = poolRequestId++
+    const timer = setTimeout(() => {
+      handler = null
+      resolve(null)
+    }, req.timeMs + 8000) // 兜底超时：正常由 deadline 控制
+    let handler: ((ev: MessageEvent<NnSearchResponse>) => void) | null = (ev) => {
+      if (ev.data?.id !== id) return
+      clearTimeout(timer)
+      handler = null
+      if (ev.data.ok && ev.data.result) resolve(ev.data.result)
+      else resolve(null)
+    }
+    entry.worker.onmessage = handler
+    entry.worker.postMessage({ ...req, id })
+  })
+}
+
+export interface NnParallelOptions extends NnMctsOptions {
+  /** 并行子 Worker 数（线程设置；实际 ≤ min(threads, 8, 可用核数)） */
+  threads: number
+}
+
+/**
+ * 根并行 MCTS：K 个子 Worker 各建一棵带根噪声的树，汇总访问次数选点。
+ * 任一子 Worker 失败只损失该树；全部失败返回 null（调用方回退单树）。
+ */
+export async function nnParallelPickMove(state: GameState, opts: NnParallelOptions): Promise<NnMoveResult | null> {
+  const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 8
+  const k = Math.max(1, Math.min(opts.threads, 8, cores - 1))
+  const available = ensurePool(k)
+  if (available <= 1) return null // 并行不可用 → 调用方回退单树
+
+  const myColor: Color = state.moves.length % 2 === 0 ? 1 : 2
+  const t0 = Date.now()
+  const perSims = Math.ceil(opts.sims / available)
+  const jobs = pool.slice(0, available).map((entry, i) =>
+    requestSearch(entry, {
+      board: state.board,
+      color: myColor,
+      movesCount: state.moves.length,
+      timeMs: opts.timeMs,
+      sims: perSims,
+      noise: { eps: 0.15, alpha: 1.0, seed: Date.now() ^ (i * 0x9e3779b9) }
+    })
+  )
+  const results = await Promise.all(jobs)
+  const elapsedMs = Date.now() - t0
+  const combined = combineMctsResults(results)
+  if (!combined) return null
+  const move = mctsResultToMove(combined, myColor, available)
+  move.report.elapsedMs = elapsedMs
+  return move
 }
 
 export interface NnMoveResult {
