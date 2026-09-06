@@ -37,7 +37,14 @@ function getSession(): Promise<InferenceSession | null> {
     sessionPromise = (async () => {
       try {
         const ort = await import('onnxruntime-web')
-        ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/'
+        // 与主 Worker 一致：本地 wasm + 多线程（隔离头由主进程注入）
+        ort.env.wasm.wasmPaths = '/ort/'
+        try {
+          const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4
+          ort.env.wasm.numThreads = Math.max(1, Math.min(4, cores - 1))
+        } catch {
+          /* 环境不支持则保持默认 */
+        }
         const sess = await ort.InferenceSession.create(modelUrl, { executionProviders: ['wasm'] })
         return sess
       } catch (err) {

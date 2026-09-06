@@ -28,7 +28,9 @@
     }
   },
   "scripts": {
+    "predev": "node scripts/copy-ort-assets.mjs",
     "dev": "electron-vite dev",
+    "prebuild": "node scripts/copy-ort-assets.mjs",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
     "test": "vitest run",

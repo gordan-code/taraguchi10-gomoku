@@ -12,3 +12,5 @@ AI-ROADMAP.md
 renju-*.json
 .vscode/
 .idea/
+src/renderer/public/ort/
+node_modules/.eval-cache/

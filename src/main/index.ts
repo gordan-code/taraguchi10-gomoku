@@ -1,6 +1,19 @@
-import { app, BrowserWindow, ipcMain, dialog, protocol } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, protocol, session } from 'electron'
 import { readFileSync, writeFileSync } from 'fs'
 import { join, normalize, sep, extname } from 'path'
+
+/**
+ * 跨源隔离（COOP/COEP）：启用 SharedArrayBuffer，
+ * onnxruntime-web 的多线程 WASM 后端（numThreads）依赖它。
+ * - 生产：app:// 协议的每个响应都带隔离头 + CORP
+ * - 开发：Vite dev server (http://localhost:5173) 经 webRequest 注入
+ * COEP 用 credentialless：Chromium 支持且不要求跨源子资源带 CORP，兼容性最好。
+ */
+const ISOLATION_HEADERS: Record<string, string> = {
+  'Cross-Origin-Opener-Policy': 'same-origin',
+  'Cross-Origin-Embedder-Policy': 'credentialless',
+  'Cross-Origin-Resource-Policy': 'same-origin'
+}
 
 /**
  * 生产环境下渲染进程通过 `file://` 加载，而 Chromium 禁止 `file://` 页面
@@ -79,16 +92,25 @@ function createWindow(): void {
 }
 
 app.whenReady().then(() => {
+  // 开发模式：给 Vite dev server 的响应注入隔离头
+  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    if (details.url.startsWith('http://localhost:5173') || details.url.startsWith('http://127.0.0.1:5173')) {
+      callback({ responseHeaders: { ...details.responseHeaders, ...ISOLATION_HEADERS } })
+    } else {
+      callback({})
+    }
+  })
+
   protocol.handle('app', (request) => {
     const url = new URL(request.url)
     const filePath = resolveRendererFile(url.pathname)
     try {
       const data = readFileSync(filePath)
       const mime = MIME[extname(filePath).toLowerCase()] ?? 'application/octet-stream'
-      return new Response(data, { headers: { 'Content-Type': mime } })
+      return new Response(data, { headers: { 'Content-Type': mime, ...ISOLATION_HEADERS } })
     } catch (err) {
       console.error('[protocol] 读取失败', filePath, String(err))
-      return new Response('Not Found', { status: 404 })
+      return new Response('Not Found', { status: 404, headers: { ...ISOLATION_HEADERS } })
     }
   })
 

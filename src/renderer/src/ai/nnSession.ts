@@ -20,9 +20,10 @@ async function loadSession(): Promise<InferenceSession | null> {
     sessionPromise = (async () => {
       try {
         const ort = await import('onnxruntime-web')
-        // onnxruntime-web 的 wasm 二进制默认在 Electron app:// 下解析不到，
-        // 这里显式指向 CDN。离线部署时改为本地打包的 wasm 路径即可。
-        ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/'
+        // wasm 二进制本地化（public/ort/，predev/prebuild 复制）：离线可用，
+        // 且同源加载配合 COOP/COEP 隔离头才能启用多线程 WASM 后端。
+        // 绝对路径 '/ort/' 在主线程与 Worker 语境下都解析到同源根。
+        ort.env.wasm.wasmPaths = '/ort/'
         // 多线程 WASM 后端：需要 cross-origin isolation 才生效，无隔离时静默回退单线程
         try {
           const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4
@@ -30,7 +31,9 @@ async function loadSession(): Promise<InferenceSession | null> {
         } catch {
           /* 环境不支持则保持默认 */
         }
-        console.log('[nn] 正在加载模型:', modelUrl)
+        console.log(
+          `[nn] 正在加载模型: ${modelUrl} | crossOriginIsolated=${String((self as unknown as { crossOriginIsolated?: boolean }).crossOriginIsolated)} numThreads=${ort.env.wasm.numThreads}`
+        )
         const sess = await ort.InferenceSession.create(modelUrl, { executionProviders: ['wasm'] })
         console.log('[nn] ONNX 模型加载成功:', modelUrl)
         return sess
