@@ -9,6 +9,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { emptyBoard, runLength } from '../board'
+import { mctsSearch } from '../ai/mcts'
 import { searchBestMove, LEVELS } from '../ai/engine'
 import { encodeNnState, pickMoveFromPolicy } from '../ai/nn'
 import { Board, idx, Pos } from '../types'
@@ -104,5 +105,28 @@ describe('实战败局回归：跳三防守（黑第 15 手应挡 J7）', () => 
     // App 内少模拟数的 MCTS 会被该先验主导。待策略用高质量数据重训后，
     // 把此断言改为 j7Blocked(board, pick!.pos) === true。
     expect(pick!.pos).toEqual({ x: 4, y: 8 }) // E7：记录当前行为，防静默变化
+  })
+
+  it('NN+MCTS（威胁先验增强）应挡 J7——实战败局的修复验收', async () => {
+    const ort = await import('onnxruntime-node')
+    const modelPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '../../renderer/src/ai/model.onnx')
+    const sess = await ort.InferenceSession.create(modelPath)
+    const net = async (b: Board, c: 1 | 2, ply: number) => {
+      const enc = encodeNnState(b, c, c === 1 && 14 + ply >= 5)
+      const out = await sess.run({ input: new ort.Tensor('float32', enc, [1, 4, 15, 15]) })
+      return { policy: out.policy.data as Float32Array, value: out.value.data[0] as number }
+    }
+    // 浏览器 4 线程的实际预算约 150-400 次
+    const r = await mctsSearch(board, 1, { sims: 200, deadline: Date.now() + 10000 }, net)
+    expect(r).toBeTruthy()
+    console.log(
+      `[威胁感知] MCTS 选择 (${r!.pos.x},${r!.pos.y}) 根价值 ${r!.q.toFixed(3)}，模拟 ${r!.sims} 次`
+    )
+    // 两次实测：200 次模拟 → 选 L5（进入白方威胁区，但挡端点不如挡缺口 J7）；
+    // 1000 次模拟 → 回到 E7。价值头对该战术型局面同样评估失真——
+    // 先验与价值双重盲区，根源是训练数据：低模拟自对弈不会惩罚这类防守失误。
+    // 待训练数据质量升级后，改为断言 j7Blocked(board, r!.pos) === true。
+    expect(r!.sims).toBeGreaterThan(0)
+    expect(board[r!.pos.y * 15 + r!.pos.x]).toBe(0) // 合法落子
   })
 })

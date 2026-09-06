@@ -8,7 +8,7 @@
  * 「走入该节点一方」的价值，因此父节点选子时直接用 w/n。
  */
 import { Board, Color, Pos, SIZE, idx } from '../types'
-import { candidateMoves } from './engine'
+import { candidateMoves, fourThreatMoves } from './engine'
 import { checkForbidden } from '../forbidden'
 import { runLength } from '../board'
 
@@ -33,6 +33,11 @@ export interface MctsOptions {
   cpuct?: number
   /** 根先验 Dirichlet 噪声（并行多树时提供多样性；同一 seed 可复现） */
   rootNoise?: { eps: number; alpha: number; seed: number }
+  /** 经典威胁先验增强强度（默认 0.2）：对手成四点与我方冲四点的
+   *  先验加权。少模拟数的 MCTS 会被策略先验的错误偏好主导
+   *  （实战败局：跳三防点 J7 未被探索），用传统威胁知识保证
+   *  这些点进入搜索视野——是否正确由价值头与访问量最终裁决。 */
+  threatBoost?: number
 }
 
 export interface MctsVisit {
@@ -344,6 +349,29 @@ export async function mctsSearch(
     const logits: number[] = []
     for (const i of legal) logits.push(policy[i] ?? 0)
     node.priors = softmax(logits)
+    // 经典威胁先验增强（仅根节点）：对手成四点 = 必须考虑防守的点，
+    // 我方冲四点 = 可行的进攻手段。给它们保底探索预算。
+    if (node === root) {
+      const boost = opts.threatBoost ?? 0.2
+      if (boost > 0) {
+        const threatPts = new Set<number>([
+          ...fourThreatMoves(work, node.toMove),
+          ...fourThreatMoves(work, node.toMove === 1 ? 2 : 1)
+        ])
+        let boosted = 0
+        for (let k = 0; k < node.legal.length; k++) {
+          if (threatPts.has(node.legal[k])) {
+            node.priors[k] += boost
+            boosted++
+          }
+        }
+        if (boosted > 0) {
+          let sum = 0
+          for (let k = 0; k < node.priors.length; k++) sum += node.priors[k]
+          for (let k = 0; k < node.priors.length; k++) node.priors[k] /= sum
+        }
+      }
+    }
     // 根先验噪声：并行多树的多样性来源（仅根展开时施加）
     if (node === root && opts.rootNoise) {
       const rng = makeRng(opts.rootNoise.seed)
