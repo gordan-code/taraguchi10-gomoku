@@ -6,6 +6,7 @@ import { AiReport } from '@shared/ai/report'
 import { LEVELS, dynamicTimeMs, probeForcedWin } from '@shared/ai/engine'
 import type { SearchProgress } from '@shared/ai/engine'
 import { nnMctsPickMove, nnPickPlayMove } from './nnSession'
+import { lookupBookMove } from '@shared/ai/book'
 import { wasmSearchBestMove } from './wasmEngine'
 
 export interface AiRequest {
@@ -75,6 +76,22 @@ self.onmessage = async (e: MessageEvent<AiRequest>) => {
   const req = e.data
   try {
     const actor = currentActor(req.state)
+
+    // 开局库：中盘前 6 手命中直接落子（毫秒级），双引擎通用，失败静默回退
+    if (actor && actor.kind === 'move' && req.state.phase === 'PLAY') {
+      const bookPos = lookupBookMove(req.state)
+      if (bookPos) {
+        const resp: AiResponse = {
+          id: req.id,
+          ok: true,
+          event: { type: 'move', pos: bookPos },
+          reason: `开局库命中（第 ${req.state.moves.length + 1} 手）`,
+          report: { engine: 'book', extra: { 引擎: '开局库' } }
+        }
+        self.postMessage(resp)
+        return
+      }
+    }
 
     // 中盘落子：engine=onnx 时优先 神经网络+MCTS（失败回退单次策略，再回退 Negamax）
     if (req.engine !== 'negamax' && actor && actor.kind === 'move' && req.state.phase === 'PLAY') {
