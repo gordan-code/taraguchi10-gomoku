@@ -895,7 +895,10 @@ export async function exportGame(psq: boolean): Promise<void> {
     showToast('文件对话框不可用（非 Electron 环境）')
     return
   }
-  const date = new Date().toISOString().slice(0, 10)
+  // 本地时间精确到秒：避免 UTC 偏移造成困惑，多次导出也不重名
+  const now = new Date()
+  const p2 = (n: number) => String(n).padStart(2, '0')
+  const date = `${now.getFullYear()}-${p2(now.getMonth() + 1)}-${p2(now.getDate())}-${p2(now.getHours())}${p2(now.getMinutes())}${p2(now.getSeconds())}`
   const suffix = resultSuffix(store.game)
   const contents = psq ? exportPsq(store.game) : JSON.stringify(serializeRecord(store.game), null, 2)
   const r = await window.renju.saveFile({

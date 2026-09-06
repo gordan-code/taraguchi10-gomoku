@@ -73,3 +73,45 @@ describe('战术危机评估', () => {
     expect(tac.mustBlockPoints.length).toBe(0)
   })
 })
+
+describe('第二盘实战败局回归（2026-09-06 23:44，白 G5-I7-H6 活三未被堵）', () => {
+  const RECORD2: Array<[string, 1 | 2]> = [
+    ['H8', 1], ['I8', 2], ['G9', 1], ['I7', 2], ['D12', 1],
+    ['I9', 2], ['I10', 1], ['H7', 2], ['E11', 1], ['F10', 2],
+    ['I5', 1], ['K10', 2], ['J9', 1], ['J7', 2], ['K7', 1],
+    ['H6', 2], ['H11', 1], ['K8', 2], ['F13', 1], ['G12', 2],
+    ['E13', 1], ['M10', 2], ['L9', 1], ['G5', 2]
+  ]
+
+  function posOf(name: string) {
+    return { x: name.charCodeAt(0) - 65, y: 15 - Number(name.slice(1)) }
+  }
+
+  it('第 24 手后：白 G5-I7-H6 活三应触发战术分流（识别 F4/J8 防守点）', () => {
+    const b = emptyBoard()
+    for (const [name, color] of RECORD2 as Array<[string, 1 | 2]>) {
+      const p = posOf(name)
+      b[idx(p.x, p.y)] = color
+    }
+    // 黑第 25 手行棋
+    const tac = assessTactics(b, 1)
+    expect(tac.urgentWin).toBeNull()
+    const names = tac.mustBlockPoints.map((p) => String.fromCharCode(65 + p.x) + (15 - p.y))
+    // 白方成四点 F4 与 J8 都会形成活四类（两个成五点）
+    expect(names).toContain('F4')
+    expect(names).toContain('J8')
+  })
+
+  it('第 26 手后：白 F4 成四（E3/J8 双五点）仍应触发内核防守', () => {
+    const RECORD3 = [...RECORD2, ['F4', 2]]
+    const b = emptyBoard()
+    for (const [name, color] of RECORD3 as Array<[string, 1 | 2]>) {
+      const p = posOf(name)
+      b[idx(p.x, p.y)] = color
+    }
+    const tac = assessTactics(b, 1)
+    const names = tac.mustBlockPoints.map((p) => String.fromCharCode(65 + p.x) + (15 - p.y))
+    expect(names).toContain('E3')
+    expect(names).toContain('J8')
+  })
+})
