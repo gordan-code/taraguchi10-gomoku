@@ -94,7 +94,7 @@ function createWindow(): void {
 app.whenReady().then(() => {
   // 开发模式：给 Vite dev server 的响应注入隔离头
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
-    if (details.url.startsWith('http://localhost:5173') || details.url.startsWith('http://127.0.0.1:5173')) {
+    if (details.url.startsWith('http://localhost:') || details.url.startsWith('http://127.0.0.1:')) {
       callback({ responseHeaders: { ...details.responseHeaders, ...ISOLATION_HEADERS } })
     } else {
       callback({})

@@ -12,6 +12,11 @@ import { GameState } from '@shared/fsm'
 import { Color, Pos } from '@shared/types'
 import { AiReport } from '@shared/ai/report'
 import modelUrl from './model.onnx?url'
+// ORT wasm 加载器本地化：?url 让 Vite 处理资源（dev 直接伺服、build 哈希打包），
+// 配合 wasmPaths 对象形式显式传给 ORT——不能用 public/ 目录（dev 下禁止 import()），
+// 也不能走 CDN（离线不可用，且 COEP 隔离下跨源资源会被拦）
+import ortMjsUrl from './ort/ort-wasm-simd-threaded.jsep.mjs?url'
+import ortWasmUrl from './ort/ort-wasm-simd-threaded.jsep.wasm?url'
 
 let sessionPromise: Promise<InferenceSession | null> | null = null
 
@@ -20,11 +25,11 @@ async function loadSession(): Promise<InferenceSession | null> {
     sessionPromise = (async () => {
       try {
         const ort = await import('onnxruntime-web')
-        // wasm 二进制本地化（public/ort/，predev/prebuild 复制）：离线可用，
-        // 且同源加载配合 COOP/COEP 隔离头才能启用多线程 WASM 后端。
-        // 绝对路径 '/ort/' 在主线程与 Worker 语境下都解析到同源根。
-        ort.env.wasm.wasmPaths = '/ort/'
-        // 多线程 WASM 后端：需要 cross-origin isolation 才生效，无隔离时静默回退单线程
+        // wasm 加载器本地化：?url 资源 + env 级 wasmPaths（对象形式显式指明 mjs/wasm；
+        // 注意它是 env 级设置，不是 InferenceSession.create 的会话选项）
+        ort.env.wasm.wasmPaths = { mjs: ortMjsUrl, wasm: ortWasmUrl }
+        // 多线程 WASM 后端：需要 cross-origin isolation（主进程注入 COOP/COEP）才生效，
+        // 无隔离时静默回退单线程
         try {
           const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4
           ort.env.wasm.numThreads = Math.max(1, Math.min(4, cores - 1))

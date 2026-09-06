@@ -10,6 +10,8 @@ import { encodeNnState } from '@shared/ai/nn'
 import type { Board, Color } from '@shared/types'
 import type { InferenceSession } from 'onnxruntime-web'
 import modelUrl from './model.onnx?url'
+import ortMjsUrl from './ort/ort-wasm-simd-threaded.jsep.mjs?url'
+import ortWasmUrl from './ort/ort-wasm-simd-threaded.jsep.wasm?url'
 
 export interface NnSearchRequest {
   id: number
@@ -37,8 +39,8 @@ function getSession(): Promise<InferenceSession | null> {
     sessionPromise = (async () => {
       try {
         const ort = await import('onnxruntime-web')
-        // 与主 Worker 一致：本地 wasm + 多线程（隔离头由主进程注入）
-        ort.env.wasm.wasmPaths = '/ort/'
+        // 与主 Worker 一致：本地 wasm 资源（env 级 wasmPaths）+ 多线程（隔离头由主进程注入）
+        ort.env.wasm.wasmPaths = { mjs: ortMjsUrl, wasm: ortWasmUrl }
         try {
           const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4
           ort.env.wasm.numThreads = Math.max(1, Math.min(4, cores - 1))
