@@ -5,8 +5,9 @@
 ## 功能
 
 - **完整塔拉山口-10 规则**：天元开局 → 3×3/5×5/7×7 逐级区域约束 → 5 次交换决策 → 走法一（9×9 直接落子 + 最后交换权）/ 走法二（十打点报价 + 白方十选一）→ 第 6 手进入中盘
-- **人机对弈**：可选执黑/执白/随机；中盘引擎可选 Negamax（Rust/WASM 搜索）或神经网络（ONNX 推理），失败自动回退
+- **人机对弈**：可选执黑/执白/随机；中盘引擎可选神经网络（NN+MCTS）或 Negamax（Rust/WASM 搜索），失败自动回退
 - **AI 观战**：AI vs AI 自动对弈，1x/2x/4x/瞬时倍速
+- **NN+MCTS 神经引擎**：AlphaZero 风格 PUCT 蒙特卡洛树搜索（策略先验引导 + 价值头评估，一步取胜预检），onnxruntime 推理；对打实测 16 局 12:4 胜 WASM 搜索内核
 - **Rust/WASM 搜索内核**：no_std Rust 编译为 WebAssembly（~28KB），在 Worker 内运行，含置换表 / PVS / 杀手着 / 历史启发 / 期望窗口 / LMR / 威胁延伸；10 秒预算下名义深度 10、威胁线深度（选择性深度）18-20
 - **威胁空间搜索（VCT/VCF）**：毫秒级必胜探测，冲四连招、活四/双四强制线在搜索前直接识别
 - **禁手系统**：黑方三三/四四/长连判定（含假三、嵌套禁手等 RIF 严格口径），实时禁手点标记，五连与禁手同达时五连优先
@@ -22,7 +23,7 @@
 ```bash
 npm install
 npm run dev        # 开发模式
-npm run test       # 运行测试（79 个用例）
+npm run test       # 运行测试（84 个用例）
 npm run typecheck  # 类型检查
 npm run build      # 构建
 npm run package    # 打包 Windows 安装包（release/）

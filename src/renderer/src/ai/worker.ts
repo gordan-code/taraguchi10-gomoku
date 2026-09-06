@@ -5,7 +5,7 @@ import type { AiDecision } from '@shared/ai/opening'
 import { AiReport } from '@shared/ai/report'
 import { LEVELS, dynamicTimeMs, probeForcedWin } from '@shared/ai/engine'
 import type { SearchProgress } from '@shared/ai/engine'
-import { nnPickPlayMove } from './nnSession'
+import { nnMctsPickMove, nnPickPlayMove } from './nnSession'
 import { wasmSearchBestMove } from './wasmEngine'
 
 export interface AiRequest {
@@ -76,10 +76,14 @@ self.onmessage = async (e: MessageEvent<AiRequest>) => {
   try {
     const actor = currentActor(req.state)
 
-    // 中盘落子：engine=onnx 时优先神经网络（失败回退 Negamax）；engine=negamax 直接搜索
+    // 中盘落子：engine=onnx 时优先 神经网络+MCTS（失败回退单次策略，再回退 Negamax）
     if (req.engine !== 'negamax' && actor && actor.kind === 'move' && req.state.phase === 'PLAY') {
       const t0 = Date.now()
-      const nn = await nnPickPlayMove(req.state)
+      const color: Color = req.state.moves.length % 2 === 0 ? 1 : 2
+      const timeMs = Math.min(3000, Math.max(800, dynamicTimeMs(req.state.board, color, 2000)))
+      const nn =
+        (await nnMctsPickMove(req.state, { timeMs, sims: 384 }).catch(() => null)) ??
+        (await nnPickPlayMove(req.state))
       if (nn) {
         // NN 路径不走 decideAiAction 的统一计时，这里单独记录耗时
         nn.report.elapsedMs = Date.now() - t0

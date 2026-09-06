@@ -56,10 +56,12 @@ async function bundleTsEngine() {
   const root = process.cwd()
   const abs = (p) => path.resolve(root, p)
   const entry = `
-export { searchBestMove, probeForcedWin, candidateMoves } from ${JSON.stringify(abs('src/shared/ai/engine.ts'))}
+export { searchBestMove, probeForcedWin, candidateMoves, dynamicTimeMs } from ${JSON.stringify(abs('src/shared/ai/engine.ts'))}
 export { checkForbidden } from ${JSON.stringify(abs('src/shared/forbidden.ts'))}
 export { emptyBoard, runLength } from ${JSON.stringify(abs('src/shared/board.ts'))}
 export { SIZE } from ${JSON.stringify(abs('src/shared/types.ts'))}
+export { mctsSearch } from ${JSON.stringify(abs('src/shared/ai/mcts.ts'))}
+export { encodeNnState } from ${JSON.stringify(abs('src/shared/ai/nn.ts'))}
 `
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'renju-eval-'))
   const entryPath = path.join(dir, 'entry.ts')
@@ -168,7 +170,7 @@ function openingMoves(mod, seed, plies) {
 
 let mod_ = null // 规则函数（bundle 后注入）
 
-function playGame(adapters, blackIdx, opening, cfg) {
+async function playGame(adapters, blackIdx, opening, cfg) {
   const board = mod.emptyBoard()
   let color = 1
   for (const m of opening.moves) {
@@ -186,7 +188,7 @@ function playGame(adapters, blackIdx, opening, cfg) {
     const idx = color === 1 ? blackIdx : 1 - blackIdx
     const eng = adapters[idx]
     const t0 = Date.now()
-    const r = eng.pick(board, color, cfg.timeMs)
+    const r = await eng.pick(board, color, cfg.timeMs)
     const elapsed = Date.now() - t0
     const s = stats[idx]
     s.moves++
@@ -231,6 +233,39 @@ const { mod, dir } = await bundleTsEngine()
 mod_ = mod
 
 // A/B 各自独立的 WASM 实例（同文件也各起一份，互不串状态）
+async function makeNnAdapter(mod, label, cfg) {
+  // Node 侧用 onnxruntime-node（原生、快），与浏览器 onnxruntime-web 共享 mctsSearch 逻辑
+  const ort = await import('onnxruntime-node')
+  const modelPath = path.resolve('src/renderer/src/ai/model.onnx')
+  const sess = await ort.InferenceSession.create(modelPath)
+  let movesCount = cfg.openingPly // pick 时为已落子数（净调用时 + ply）
+  return {
+    label,
+    async pick(board, color, timeMs) {
+      const m0 = movesCount
+      const r = await mod.mctsSearch(
+        board,
+        color,
+        { sims: 1500, deadline: Date.now() + Math.max(300, timeMs) },
+        async (b, c, ply) => {
+          const enc = mod.encodeNnState(b, c, c === 1 && m0 + ply >= 5)
+          const out = await sess.run({ input: new ort.Tensor('float32', enc, [1, 4, 15, 15]) })
+          return { policy: out.policy.data, value: out.value.data[0] }
+        }
+      )
+      movesCount++
+      if (!r) return { pos: null, score: 0, depth: 0, seldepth: 0, nodes: 0 }
+      return {
+        pos: r.pos,
+        score: color === 1 ? r.q : -r.q, // 黑方视角
+        depth: r.depth,
+        seldepth: r.depth,
+        nodes: r.sims
+      }
+    }
+  }
+}
+
 async function buildAdapters() {
   const out = []
   for (const [kind, label, wasmKey] of [
@@ -239,6 +274,7 @@ async function buildAdapters() {
   ]) {
     if (kind === 'ts') out.push(makeTsAdapter(mod, label, cfg))
     else if (kind === 'wasm') out.push(await makeWasmAdapter(mod, label, cfg[wasmKey], cfg))
+    else if (kind === 'nn') out.push(await makeNnAdapter(mod, label, cfg))
     else throw new Error(`未知引擎类型: ${kind}`)
   }
   return out
@@ -255,7 +291,7 @@ const statAcc = [null, null] // 每引擎汇总
 for (let g = 0; g < cfg.games; g++) {
   const blackIdx = g % 2 // 偶数局 A 执黑
   const opening = openingMoves(mod, cfg.seed + g * 7919, cfg.openingPly)
-  const { result, ply, stats, records, board } = playGame(adapters, blackIdx, opening, cfg)
+  const { result, ply, stats, records, board } = await playGame(adapters, blackIdx, opening, cfg)
 
   if (argv.includes('--dump')) {
     console.log(`  —— 局 ${g + 1} 着法（x=黑 o=白，行=y 列=x，*=最后一手）——`)

@@ -5,6 +5,7 @@
  */
 import type { InferenceSession } from 'onnxruntime-web'
 import { encodeNnState, pickMoveFromPolicy } from '@shared/ai/nn'
+import { mctsSearch } from '@shared/ai/mcts'
 import { GameState } from '@shared/fsm'
 import { Color, Pos } from '@shared/types'
 import { AiReport } from '@shared/ai/report'
@@ -31,6 +32,71 @@ async function loadSession(): Promise<InferenceSession | null> {
     })()
   }
   return sessionPromise
+}
+
+/** 把 onnxruntime 会话包装成 MCTS 的 net 接口（forbiddenActive 随 ply 递增对齐训练口径） */
+async function makeMctsNet(
+  state: GameState
+): Promise<((board: import('@shared/types').Board, color: Color, ply: number) => Promise<{ policy: Float32Array; value: number }>) | null> {
+  const sess = await loadSession()
+  if (!sess) return null
+  const ort = await import('onnxruntime-web')
+  return async (board, color, ply) => {
+    const forbiddenActive = color === 1 && state.moves.length + ply >= 5
+    const enc = encodeNnState(board, color, forbiddenActive)
+    const out = await sess.run({ input: new ort.Tensor('float32', enc, [1, 4, 15, 15]) })
+    return {
+      policy: out.policy.data as Float32Array,
+      value: (out.value.data as Float32Array)[0]
+    }
+  }
+}
+
+export interface NnMctsOptions {
+  /** 搜索时间预算（毫秒） */
+  timeMs: number
+  /** 模拟次数上限 */
+  sims: number
+}
+
+/** 中盘（PLAY）用 策略先验 + 价值 的 PUCT MCTS 选点；模型不可用/失败返回 null。 */
+export async function nnMctsPickMove(state: GameState, opts: NnMctsOptions): Promise<NnMoveResult | null> {
+  const net = await makeMctsNet(state)
+  if (!net) return null
+  try {
+    const myColor: Color = state.moves.length % 2 === 0 ? 1 : 2
+    const t0 = Date.now()
+    const r = await mctsSearch(
+      state.board,
+      myColor,
+      { sims: opts.sims, deadline: Date.now() + opts.timeMs },
+      net
+    )
+    if (!r) return null
+    const elapsedMs = Date.now() - t0
+    const side = myColor === 1 ? '黑' : '白'
+    const qText = (r.q >= 0 ? '+' : '') + r.q.toFixed(2)
+    const topText = r.top.map((t) => `${t.pos.x + 1},${t.pos.y + 1}(${t.n})`).join(' ')
+    return {
+      pos: r.pos,
+      reason: `神经网络+MCTS（${side}）根价值 ${qText}，${r.sims} 次模拟 / 树深 ${r.depth}，主变访问 ${topText}`,
+      report: {
+        engine: 'neural',
+        score: myColor === 1 ? r.q : -r.q, // 统一为黑方视角
+        depth: r.depth,
+        nodes: r.sims,
+        extra: {
+          引擎: 'NN+MCTS',
+          模拟次数: r.sims,
+          树深: r.depth,
+          根价值: Number(r.q.toFixed(3))
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[nn] MCTS 搜索失败，回退单次策略：', err)
+    return null
+  }
 }
 
 export interface NnMoveResult {
