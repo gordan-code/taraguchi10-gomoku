@@ -46,6 +46,8 @@ const cfg = {
   seed: Number(arg('seed', 20260905)),
   engineA: arg('engine-a', 'ts'),
   engineB: arg('engine-b', 'wasm'),
+  nnModelA: arg('nn-model-a', 'src/renderer/src/ai/model.onnx'),
+  nnModelB: arg('nn-model-b', 'src/renderer/src/ai/model.onnx'),
   wasmA: arg('wasm-a', 'rust-engine/target/wasm32-unknown-unknown/release/renju_engine.wasm'),
   wasmB: arg('wasm-b', 'src/renderer/src/ai/renju_engine.wasm')
 }
@@ -234,13 +236,13 @@ mod_ = mod
 let nnWorkerCacheDir = null
 
 // A/B 各自独立的 WASM 实例（同文件也各起一份，互不串状态）
-async function makeNnAdapter(mod, label, cfg, tmpDir) {
+async function makeNnAdapter(mod, label, cfg, tmpDir, modelFile) {
   // 与生产架构一致：K 个 Worker 线程各自独立会话 + 独立树（根噪声多样性），主线程汇总。
   // nn-delay 模拟浏览器推理延迟（onnxruntime-web ~20-40ms/次），
   // 在延迟约束机制下根并行的 K 倍模拟才有意义（Node 原生 ~0.4ms/次时单树更优）。
   const { Worker } = await import('node:worker_threads')
   const ort = await import('onnxruntime-node')
-  const modelPath = path.resolve('src/renderer/src/ai/model.onnx')
+  const modelPath = path.resolve(modelFile)
   // 预热一个会话确认模型可用（各 Worker 线程内各自再建）
   await ort.InferenceSession.create(modelPath)
   const k = Math.max(1, Math.min(Number(arg('nn-threads', 4)), 16))
@@ -328,13 +330,13 @@ parentPort.on('message', async (req) => {
 
 async function buildAdapters() {
   const out = []
-  for (const [kind, label, wasmKey] of [
+  for (const [i, [kind, label, wasmKey]] of [
     [cfg.engineA, 'A', 'wasmA'],
     [cfg.engineB, 'B', 'wasmB']
-  ]) {
+  ].entries()) {
     if (kind === 'ts') out.push(makeTsAdapter(mod, label, cfg))
     else if (kind === 'wasm') out.push(await makeWasmAdapter(mod, label, cfg[wasmKey], cfg))
-    else if (kind === 'nn') out.push(await makeNnAdapter(mod, label, cfg, dir))
+    else if (kind === 'nn') out.push(await makeNnAdapter(mod, label, cfg, dir, i === 0 ? cfg.nnModelA : cfg.nnModelB))
     else throw new Error(`未知引擎类型: ${kind}`)
   }
   return out
