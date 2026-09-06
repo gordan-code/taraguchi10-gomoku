@@ -7,6 +7,7 @@ import { LEVELS, dynamicTimeMs, probeForcedWin } from '@shared/ai/engine'
 import type { SearchProgress } from '@shared/ai/engine'
 import { nnMctsPickMove, nnPickPlayMove } from './nnSession'
 import { lookupBookMove } from '@shared/ai/book'
+import { assessTactics } from '@shared/ai/tactics'
 import { wasmSearchBestMove } from './wasmEngine'
 
 export interface AiRequest {
@@ -93,14 +94,59 @@ self.onmessage = async (e: MessageEvent<AiRequest>) => {
       }
     }
 
-    // 中盘落子：engine=onnx 时优先 神经网络+MCTS（失败回退单次策略，再回退 Negamax）
+    // 中盘落子（engine=onnx）：战术分流 + NN+MCTS
+    // 混合策略：安静局面交给 NN（位置感强）；出现活四类威胁时切换搜索内核
+    // 全力防守（战术可靠，实战败局回归测试验证）。NN 失败回退单次策略。
     if (req.engine !== 'negamax' && actor && actor.kind === 'move' && req.state.phase === 'PLAY') {
       const t0 = Date.now()
       const color: Color = req.state.moves.length % 2 === 0 ? 1 : 2
       const timeMs = Math.min(3000, Math.max(800, dynamicTimeMs(req.state.board, color, 2000)))
-      // 单树 MCTS 为默认：根并行（多 Worker 独立噪声树）经对打实测不优于单树
-      // （原生 9:7、浏览器机制 6:6 vs 单树 7:5/12:4），独立树重复劳动 + 噪声稀释。
-      // 并行基础设施保留在 nnSession.nnParallelPickMove，供后续实验启用。
+
+      const tac = assessTactics(req.state.board, color)
+
+      // 我方活四制胜点：立即落子
+      if (tac.urgentWin) {
+        const resp: AiResponse = {
+          id: req.id,
+          ok: true,
+          event: { type: 'move', pos: tac.urgentWin },
+          reason: 'AI 发现活四制胜点，直接落子',
+          report: { engine: 'negamax', score: 999999, depth: 1, elapsedMs: Date.now() - t0, extra: { 引擎: '战术分流' } }
+        }
+        self.postMessage(resp)
+        return
+      }
+
+      // 对手活四威胁：切换搜索内核全力防守
+      if (tac.mustBlockPoints.length > 0) {
+        const kr = await wasmSearchBestMove(req.state.board, color, {
+          ...LEVELS.master,
+          maxDepth: 14,
+          timeMs
+        }).catch(() => null)
+        if (kr && kr.move) {
+          const resp: AiResponse = {
+            id: req.id,
+            ok: true,
+            event: { type: 'move', pos: kr.move },
+            reason: `对手活四威胁，切换内核防守：深度 ${kr.depth}，评分 ${Math.round(kr.score)}`,
+            report: {
+              engine: 'negamax',
+              score: kr.score,
+              depth: kr.depth,
+              nodes: kr.nodes,
+              timedOut: kr.timedOut,
+              elapsedMs: Date.now() - t0,
+              extra: { 引擎: '战术分流·内核防守', 威胁点数: tac.mustBlockPoints.length }
+            }
+          }
+          self.postMessage(resp)
+          return
+        }
+        console.warn('[nn] 内核防守失败，回退 NN+MCTS')
+      }
+
+      // 安静局面：NN+MCTS（单树为默认：根并行经对打实测不优于单树）
       const nn = (await nnMctsPickMove(req.state, { timeMs, sims: 384 }).catch(() => null)) ?? (await nnPickPlayMove(req.state))
       if (nn) {
         // NN 路径不走 decideAiAction 的统一计时，这里单独记录耗时
