@@ -79,7 +79,7 @@ describe('开局库', () => {
 
   it('中盘（≥6 手）不再查库', () => {
     const b = emptyBoard()
-    for (let i = 0; i < 6; i++) b[(7 + i) * 15 + 7] = (i % 2) + 1
+    for (let i = 0; i < 6; i++) b[(7 + i) * 15 + 7] = ((i % 2) + 1) as 1 | 2
     const state = {
       players: [] as unknown as [Player, Player],
       blackOwner: 0 as const,
