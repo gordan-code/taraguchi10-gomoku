@@ -1270,6 +1270,10 @@ fn search_root(color: u8, cands: &[u16], n: usize, depth: i32, alpha: i32, beta:
     let mut a = alpha;
     let mut best_move = cands[0];
     let mut best_score = -INF;
+    // 已知必败（分数在 -MATE 邻域）时：所有着法都会 fail-low，零窗口/PVS
+    // 返回的是上界而非精确值，"输得最慢"的比较会被破坏 → 全窗口精确搜索。
+    // 代价可接受：必败树在威胁延伸下节点很少（实测 3 万级）。
+    let all_losing = alpha <= -(MATE - 200);
     for j in 0..n {
         let ci = cands[j] as usize;
         let r = (ci / 15) as i32;
@@ -1283,7 +1287,7 @@ fn search_root(color: u8, cands: &[u16], n: usize, depth: i32, alpha: i32, beta:
         let mut val;
         if is_winning_stone(unsafe { &BOARD }, r, c, color) {
             val = MATE;
-        } else if j == 0 {
+        } else if j == 0 || all_losing {
             val = -negamax(opp, depth - 1, -beta, -a, 1);
         } else {
             val = -negamax(opp, depth - 1, -(a + 1), -a, 1);
@@ -1383,6 +1387,10 @@ pub extern "C" fn search_best_move(color: u32, max_depth: u32, time_ms: u32, wid
         if depth > 2 && best_score > -MATE / 2 && best_score < MATE / 2 {
             alpha = best_score - 200;
             beta = best_score + 200;
+        }
+        // 已知必败：aspiration 窗口只会触发 fail-low 重搜，直接全窗口
+        if best_score <= -(MATE - 200) {
+            alpha = -MATE;
         }
         let (m, s) = search_root(col, &cands, n, depth, alpha, beta);
         if s <= alpha || s >= beta {
