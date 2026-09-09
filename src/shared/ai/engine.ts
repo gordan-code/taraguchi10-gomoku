@@ -30,7 +30,17 @@ const MATE = 1_000_000
 
 // ---------------------------------------------------------------- 评估函数
 
-const W = [0, 2, 24, 320, 3600, 1_000_000]
+/** 窗口权重（W[i] = 纯 i 子窗口分值）。可被 setEvalWeights 覆盖（texel 调参 / A/B 实验）。
+ *  2026-09-09 texel 调参：Rapfi 300 局自对弈（1434 局面）拟合 + 100 局对打筛选，
+ *  [1,8,96,600] 相对手拍权重 [2,24,320,3600] 快棋 +117 Elo（40 局 5:2、换种子 60 局复验）。 */
+let W: number[] = [0, 1, 8, 96, 600, 1_000_000]
+
+/** 注入评估权重（长度 6，[0]=占位）；返回旧权重 */
+export function setEvalWeights(w: number[]): number[] {
+  const old = W
+  if (Array.isArray(w) && w.length === 6 && w.every((x) => Number.isFinite(x))) W = w.slice()
+  return old
+}
 
 /** 所有长度 ≥5 的线（行/列/两对角）的索引序列，静态预计算 */
 const LINES: number[][] = (() => {

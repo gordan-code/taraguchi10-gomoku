@@ -53,7 +53,9 @@ const cfg = {
   nnModelB: arg('nn-model-b', 'src/renderer/src/ai/model.onnx'),
   wasmA: arg('wasm-a', 'rust-engine/target/wasm32-unknown-unknown/release/renju_engine.wasm'),
   wasmB: arg('wasm-b', 'src/renderer/src/ai/renju_engine.wasm'),
-  rapfi: arg('rapfi', 'engines/pbrain-rapfi-windows-avx2.exe')
+  rapfi: arg('rapfi', 'engines/pbrain-rapfi-windows-avx2.exe'),
+  tsWeightsA: arg('ts-weights-a', ''),
+  tsWeightsB: arg('ts-weights-b', '')
 }
 
 // ---------------------------------------------------------------- TS 引擎打包（esbuild → 临时 ESM）
@@ -62,7 +64,7 @@ async function bundleTsEngine() {
   const root = process.cwd()
   const abs = (p) => path.resolve(root, p)
   const entry = `
-export { searchBestMove, probeForcedWin, candidateMoves, dynamicTimeMs } from ${JSON.stringify(abs('src/shared/ai/engine.ts'))}
+export { searchBestMove, probeForcedWin, candidateMoves, dynamicTimeMs, setEvalWeights } from ${JSON.stringify(abs('src/shared/ai/engine.ts'))}
 export { checkForbidden } from ${JSON.stringify(abs('src/shared/forbidden.ts'))}
 export { emptyBoard, runLength } from ${JSON.stringify(abs('src/shared/board.ts'))}
 export { SIZE } from ${JSON.stringify(abs('src/shared/types.ts'))}
@@ -80,11 +82,22 @@ export { encodeNnState } from ${JSON.stringify(abs('src/shared/ai/nn.ts'))}
 
 // ---------------------------------------------------------------- 引擎适配器（统一接口：pick(board, color, timeMs) → {pos, score(行棋方视角), depth, seldepth, nodes}）
 
-function makeTsAdapter(mod, label, cfg) {
+function makeTsAdapter(mod, label, cfg, weights) {
+  // 权重注入：ts 引擎的评估权重是模块级状态。A/B 双方需要不同权重时
+  // 各自打包独立实例（bundleTsEngine 每次生成独立 esbuild 产物），
+  // 这里在同实例内按调用切换（对打是串行的，pick 内切换安全）。
+  let myWeights = null
+  let otherWeights = null
   return {
-    label,
+    label: weights ? `${label}[W=${weights.slice(1, 5).join(',')}]` : label,
     pick(board, color, timeMs) {
+      if (weights) {
+        otherWeights = mod.setEvalWeights(weights)
+        myWeights = weights
+      }
       const r = mod.searchBestMove(board, color, { maxDepth: cfg.maxDepth, timeMs, width: cfg.width, noise: 0 })
+      void myWeights
+      void otherWeights
       return {
         pos: r.move,
         score: r.score,
@@ -338,7 +351,10 @@ async function buildAdapters() {
     [cfg.engineA, 'A', 'wasmA'],
     [cfg.engineB, 'B', 'wasmB']
   ].entries()) {
-    if (kind === 'ts') out.push(makeTsAdapter(mod, label, cfg))
+    // ts 权重注入（texel 调参 A/B）：--ts-weights-a/b "w1,w2,w3,w4"（W5 五连固定 1e6）
+    const warg = i === 0 ? cfg.tsWeightsA : cfg.tsWeightsB
+    const weights = warg ? [0, ...warg.split(',').map(Number), 1_000_000] : null
+    if (kind === 'ts') out.push(makeTsAdapter(mod, label, cfg, weights))
     else if (kind === 'wasm') out.push(await makeWasmAdapter(mod, label, cfg[wasmKey], cfg))
     else if (kind === 'nn') out.push(await makeNnAdapter(mod, label, cfg, dir, i === 0 ? cfg.nnModelA : cfg.nnModelB))
     else if (kind === 'rapfi') out.push(makeRapfiAdapter(label, cfg.rapfi))
