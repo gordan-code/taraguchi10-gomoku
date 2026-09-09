@@ -14,3 +14,6 @@ renju-*.json
 .idea/
 node_modules/.eval-cache/
 src/renderer/src/ai/ort/
+
+# 外部对打引擎（体积大，不入库；见 README 评测章节）
+engines/

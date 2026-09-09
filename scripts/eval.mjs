@@ -16,8 +16,10 @@
  *   --opening-ply N  引擎接管前的随机开局手数（默认 4，含黑1天元）
  *   --adjudicate N   裁决阈值：|黑方评估分|≥N 判优方胜，否则和（默认 400）
  *   --seed N         随机种子（默认 20260905，可复现）
- *   --engine-a/b     ts | wasm
+ *   --engine-a/b     ts | wasm | nn | rapfi
  *   --wasm-a/b PATH  对应侧 WASM 文件（A/B 同为新旧内核对比时用）
+ *   --rapfi PATH     rapfi 引擎可执行文件（默认 engines/pbrain-rapfi-windows-avx2.exe，
+ *                    piskvork 协议子进程，renju 规则、单线程、256MB，外部标尺用）
  *
  * 公平性：双方均含 TS VCT 必胜预探（与生产路径一致）；评估分统一转黑方视角。
  * 判定：黑恰好五连胜 / 白≥五连胜；黑禁手即负；非法落子判负（护栏）。
@@ -27,6 +29,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import esbuild from 'esbuild'
+import { makeRapfiAdapter } from './rapfi-adapter.mjs'
 
 // ---------------------------------------------------------------- CLI
 
@@ -49,7 +52,8 @@ const cfg = {
   nnModelA: arg('nn-model-a', 'src/renderer/src/ai/model.onnx'),
   nnModelB: arg('nn-model-b', 'src/renderer/src/ai/model.onnx'),
   wasmA: arg('wasm-a', 'rust-engine/target/wasm32-unknown-unknown/release/renju_engine.wasm'),
-  wasmB: arg('wasm-b', 'src/renderer/src/ai/renju_engine.wasm')
+  wasmB: arg('wasm-b', 'src/renderer/src/ai/renju_engine.wasm'),
+  rapfi: arg('rapfi', 'engines/pbrain-rapfi-windows-avx2.exe')
 }
 
 // ---------------------------------------------------------------- TS 引擎打包（esbuild → 临时 ESM）
@@ -337,6 +341,7 @@ async function buildAdapters() {
     if (kind === 'ts') out.push(makeTsAdapter(mod, label, cfg))
     else if (kind === 'wasm') out.push(await makeWasmAdapter(mod, label, cfg[wasmKey], cfg))
     else if (kind === 'nn') out.push(await makeNnAdapter(mod, label, cfg, dir, i === 0 ? cfg.nnModelA : cfg.nnModelB))
+    else if (kind === 'rapfi') out.push(makeRapfiAdapter(label, cfg.rapfi))
     else throw new Error(`未知引擎类型: ${kind}`)
   }
   return out

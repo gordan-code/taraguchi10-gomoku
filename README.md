@@ -55,6 +55,20 @@ node scripts/eval.mjs --engine-a ts --engine-b wasm --games 1 --dump        # �
 
 输出胜/负/和、得分率与 Elo 估计、平均深度/威胁线深度/节点率。判定：黑恰好五连胜、白 ≥五连胜、黑禁手即负；着法上限后按最后评估分裁决。种子化开局可复现，先后手轮换。
 
+### 外部标尺：对打 Rapfi（Gomocup 冠军引擎）
+
+自对弈只回答"我是否比昨天的自己强"，外部引擎才提供绝对坐标。`--engine rapfi`（[rapfi-adapter.mjs](scripts/rapfi-adapter.mjs)，piskvork 协议子进程适配器）可把 [Rapfi](https://github.com/dhbloo/rapfi) 接入评测框架：
+
+```bash
+# 准备：下载 Rapfi release（Rapfi-engine.7z）解压到 engines/（已 gitignore）
+node scripts/eval.mjs --engine-a wasm --engine-b rapfi --games 100 --time 500
+node scripts/eval.mjs --engine-a rapfi --engine-b rapfi --games 4   # 镜像自检：应约 50% / Elo≈0
+```
+
+对齐口径：renju 规则（`INFO rule 4`，黑白分权 NNUE）、单线程（与 WASM 内核一致）、500ms/手快棋、种子化随机开局 4 手后引擎接管。适配器踩过三个坑（均有注释记录）：`max_memory` 需按**字节**传（Rapfi 源码 `val>>10` 转 KB，传 KB 值会把搜索内存钳到 1KB、棋力骤降）；`BOARD` 的颜色标记是**相对语义**（1=引擎自己 / 2=对手，不是绝对黑白）；`BOARD` 必须按**真实落子顺序**发子（乱序会触发 Rapfi 的 PASS 补偿、翻转其行棋方导致"替对手思考"）。
+
+**基线（2026-09-09，100 局，500ms/手）**：WASM 内核 vs Rapfi 2025-06-15 = **4 : 96，Elo -552**。差距主要来自 Rapfi 的 NNUE 评估（约 3000 Elo 级权重）对线型评估函数的碾压——这正是 texel 调参与 NN 蒸馏路线的起点标尺。
+
 ## 架构
 
 ```
