@@ -101,10 +101,9 @@ describe('实战败局回归：跳三防守（黑第 15 手应挡 J7）', () => 
       `[威胁感知] 策略首选 (${pick!.pos.x},${pick!.pos.y}) logit=${pickLogit.toFixed(3)}；` +
         `防守点 J7 logit=${j7Logit.toFixed(3)}（差距 ${(pickLogit - j7Logit).toFixed(3)}）`
     )
-    // 当前已知问题：策略偏好实战败着 E7 而非防守点 J7（先验盲区），
-    // App 内少模拟数的 MCTS 会被该先验主导。待策略用高质量数据重训后，
-    // 把此断言改为 j7Blocked(board, pick!.pos) === true。
-    expect(pick!.pos).toEqual({ x: 4, y: 8 }) // E7：记录当前行为，防静默变化
+    // 2026-09-10 KataGo 蒸馏重训（1000 万局面）后，策略首选已从实战败着 E7
+    // 变为防守点 J7——原注释预言的"高质量数据重训后"已达成，断言升级为威胁感知验收。
+    expect(j7Blocked(board, pick!.pos)).toBe(true)
   })
 
   it('NN+MCTS（威胁先验增强）应挡 J7——实战败局的修复验收', async () => {
