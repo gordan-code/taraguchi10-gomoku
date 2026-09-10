@@ -6,6 +6,7 @@ import {
   AiEngine,
   AiLevel,
   Board,
+  Color,
   GameEvent,
   GameState,
   Player,
@@ -489,7 +490,7 @@ function scheduleAi(): void {
   const player = a.player
   const level = levelOf(store.game.players[player])
   const delay = store.mode === 'ai-vs-ai' ? (store.speed === 0 ? 40 : Math.round(900 / store.speed)) : 120
-  aiTimer = setTimeout(() => {
+  aiTimer = setTimeout(async () => {
     aiTimer = null
     if (store.replayIndex !== null || store.clockPaused) return
     const a2 = currentActor(store.game)
@@ -506,10 +507,51 @@ function scheduleAi(): void {
     epoch++
     const requestId = epoch
     store.aiThinking = a2.player
+
+    // Rapfi 外部引擎：仅中盘落子（PLAY）走主进程子进程 IPC；
+    // 开局阶段（交换/走法/打点）是塔拉山口-10 特有决策，仍交给内置引擎。
+    if (
+      store.gameEngine === 'rapfi' &&
+      a2.kind === 'move' &&
+      store.game.phase === 'PLAY'
+    ) {
+      const t0 = Date.now()
+      const color: Color = store.game.moves.length % 2 === 0 ? 1 : 2
+      try {
+        // typeof 守卫：Node 测试环境无 window（rapfi 分支测试不可达，但求稳）
+        const r =
+          typeof window !== 'undefined'
+            ? await window.renju?.rapfiMove({ board: store.game.board.slice(), color, timeMs: 1000 })
+            : undefined
+        if (requestId !== epoch) return // 期间局面已变（悔棋/新局），丢弃
+        if (r && r.ok) {
+          const { x, y } = r.pos
+          store.aiThinking = null
+          store.lastReason = `Rapfi 落子 (${x},${y})`
+          store.lastReport = {
+            engine: 'rapfi',
+            elapsedMs: Date.now() - t0,
+            extra: { 引擎: 'Rapfi（Gomocup 冠军）' }
+          }
+          if (applyEventToGame({ type: 'move', pos: { x, y } }, a2.player, { report: store.lastReport })) {
+            aiFallbackCount = 0
+          } else {
+            aiFallback()
+          }
+          return
+        }
+        showToast(`Rapfi 引擎不可用（${r?.error ?? '无 IPC 桥'}），本手改用内置引擎`)
+      } catch (err) {
+        if (requestId !== epoch) return
+        showToast(`Rapfi 调用异常（${String(err)}），本手改用内置引擎`)
+      }
+      store.aiThinking = null
+    }
+
     try {
       // 传给 Worker 前脱去 Vue 响应式代理，否则 structured clone 会抛 DataCloneError
       const plainState = JSON.parse(JSON.stringify(store.game)) as GameState
-      ensureWorker().postMessage({ id: requestId, state: plainState, level, engine: store.gameEngine, threads: store.settings.searchThreads })
+      ensureWorker().postMessage({ id: requestId, state: plainState, level, engine: store.gameEngine === 'rapfi' ? 'negamax' : store.gameEngine, threads: store.settings.searchThreads })
       aiWatchdog = setTimeout(() => {
         if (requestId !== epoch || store.aiThinking === null) return
         store.aiThinking = null
@@ -788,6 +830,9 @@ export function startNewGame(cfg: NewGameConfig): void {
     clearTimeout(aiTimer)
     aiTimer = null
   }
+  // 新对局：重置主进程的 Rapfi 子进程（其内部 tracked 增量与新局不兼容）。
+  // typeof 守卫：Node 测试环境无 window。
+  if (typeof window !== 'undefined') window.renju?.rapfiStop().catch(() => {})
   let players: [Player, Player]
   let firstBlack: 0 | 1 = 0
   store.gameEngine = cfg.engine

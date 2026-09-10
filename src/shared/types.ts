@@ -55,8 +55,9 @@ export type PlayerKind = 'human' | 'ai'
 
 export type AiLevel = 'novice' | 'amateur' | 'advanced' | 'master'
 
-/** 中盘落子引擎：'negamax' = α-β 搜索；'onnx' = 神经网络（无模型时自动回退 negamax） */
-export type AiEngine = 'negamax' | 'onnx'
+/** 中盘落子引擎：'negamax' = α-β 搜索；'onnx' = 神经网络（无模型时自动回退 negamax）；
+ *  'rapfi' = 外部冠军引擎 Rapfi（主进程子进程，仅中盘 PLAY 阶段生效，开局决策仍走内置逻辑） */
+export type AiEngine = 'negamax' | 'onnx' | 'rapfi'
 
 export interface Player {
   kind: PlayerKind

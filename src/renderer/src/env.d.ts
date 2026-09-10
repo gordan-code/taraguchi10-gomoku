@@ -15,6 +15,12 @@ interface RenjuFileApi {
     contents: string
     psq?: boolean
   }) => Promise<{ name: string; error?: string } | null>
+  rapfiMove: (req: {
+    board: number[]
+    color: 1 | 2
+    timeMs: number
+  }) => Promise<{ ok: true; pos: { x: number; y: number } } | { ok: false; error: string }>
+  rapfiStop: () => Promise<void>
 }
 
 interface Window {

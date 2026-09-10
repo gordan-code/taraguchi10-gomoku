@@ -23,8 +23,9 @@
         <div class="seg">
           <button :class="{ on: engine === 'onnx' }" @click="engine = 'onnx'">神经网络（ONNX）</button>
           <button :class="{ on: engine === 'negamax' }" @click="engine = 'negamax'">Negamax 搜索</button>
+          <button :class="{ on: engine === 'rapfi' }" @click="engine = 'rapfi'">Rapfi（外部冠军引擎）</button>
         </div>
-        <p class="note">Negamax 战术精准、可解释；ONNX 用训练出的网络（棋力取决于当前快照）。</p>
+        <p class="note">Negamax 战术精准、可解释；ONNX 用训练出的网络（棋力取决于当前快照）；Rapfi 为 Gomocup 冠军级外部引擎（需 engines/ 目录，仅中盘生效，开局决策仍由内置引擎完成）。</p>
       </div>
       <div class="modal-actions">
         <button class="btn" @click="$emit('close')">取消</button>

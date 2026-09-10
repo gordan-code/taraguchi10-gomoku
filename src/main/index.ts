@@ -1,6 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog, protocol, session } from 'electron'
 import { readFileSync, writeFileSync } from 'fs'
 import { join, normalize, sep, extname } from 'path'
+import { rapfiMove, rapfiStop } from './rapfi'
 
 /**
  * 跨源隔离（COOP/COEP）：启用 SharedArrayBuffer，
@@ -160,4 +161,22 @@ ipcMain.handle('renju:saveFile', async (_e, opts: { defaultName: string; content
   } catch (err) {
     return { name: r.filePath, error: String(err) }
   }
+})
+
+// ---- Rapfi 外部引擎 IPC：对弈引擎走主进程子进程（渲染层无 node 权限）----
+
+ipcMain.handle(
+  'renju:rapfiMove',
+  async (_e, req: { board: number[]; color: 1 | 2; timeMs: number }) => {
+    try {
+      const pos = await rapfiMove(req)
+      return { ok: true as const, pos }
+    } catch (err) {
+      return { ok: false as const, error: String(err) }
+    }
+  }
+)
+
+ipcMain.handle('renju:rapfiStop', () => {
+  rapfiStop()
 })

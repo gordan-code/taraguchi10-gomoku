@@ -69,6 +69,10 @@ node scripts/eval.mjs --engine-a rapfi --engine-b rapfi --games 4   # 镜像自�
 
 **基线（2026-09-09，100 局，500ms/手）**：WASM 内核 vs Rapfi 2025-06-15 = **4 : 96，Elo -552**。差距主要来自 Rapfi 的 NNUE 评估（约 3000 Elo 级权重）对线型评估函数的碾压——这正是 texel 调参与 NN 蒸馏路线的起点标尺。texel 调参后复测：**5 : 95，Elo -512**（+40，与内部 A/B 的 +28 一致）。
 
+### 在应用内与 Rapfi 对弈
+
+图形界面也可直接选择 Rapfi 作为对手（新对局 → AI 引擎 → "Rapfi（外部冠军引擎）"）。架构：渲染层 store 在中盘（PLAY 阶段）经 IPC 把棋盘发给主进程（[src/main/rapfi.ts](src/main/rapfi.ts)），主进程持有 piskvork 子进程并复用评测适配器同款协议逻辑（BOARD 相对颜色/落子序/TURN 增量/跨局重启）；塔拉山口-10 开局决策（交换/走法/打点）仍由内置引擎完成，Rapfi 只负责中盘。应用退出/新对局时自动终止子进程（`before-quit` 钩子 + `startNewGame` 重置），无进程残留。前提：`engines/` 目录下放置 Rapfi 可执行文件（同上节，gitignore 不入库）。
+
 ### Texel 调参（2026-09-09）
 
 用 Rapfi 自对弈棋谱（300 局 / 1434 局面，[gen-tuning-data.mjs](scripts/gen-tuning-data.mjs) 驱动双 Rapfi 进程对打）拟合窗口评估权重（[texel-tune.mjs](scripts/texel-tune.mjs)，sigmoid 胜率拟合 + 单调约束坐标下降）：
