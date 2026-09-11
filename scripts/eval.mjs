@@ -55,7 +55,8 @@ const cfg = {
   wasmB: arg('wasm-b', 'src/renderer/src/ai/renju_engine.wasm'),
   rapfi: arg('rapfi', 'engines/pbrain-rapfi-windows-avx2.exe'),
   tsWeightsA: arg('ts-weights-a', ''),
-  tsWeightsB: arg('ts-weights-b', '')
+  tsWeightsB: arg('ts-weights-b', ''),
+  wasmThreads: Number(arg('wasm-threads', 4))
 }
 
 // ---------------------------------------------------------------- TS 引擎打包（esbuild → 临时 ESM）
@@ -356,6 +357,7 @@ async function buildAdapters() {
     const weights = warg ? [0, ...warg.split(',').map(Number), 1_000_000] : null
     if (kind === 'ts') out.push(makeTsAdapter(mod, label, cfg, weights))
     else if (kind === 'wasm') out.push(await makeWasmAdapter(mod, label, cfg[wasmKey], cfg))
+    else if (kind === 'wasm-parallel') out.push(await makeWasmParallelAdapter(mod, label, cfg[wasmKey], cfg, cfg.wasmThreads))
     else if (kind === 'nn') out.push(await makeNnAdapter(mod, label, cfg, dir, i === 0 ? cfg.nnModelA : cfg.nnModelB))
     else if (kind === 'rapfi') out.push(makeRapfiAdapter(label, cfg.rapfi))
     else throw new Error(`未知引擎类型: ${kind}`)
@@ -444,3 +446,115 @@ try { fs.rmSync(dir, { recursive: true, force: true }) } catch {}
 if (nnWorkerCacheDir) { try { fs.rmSync(nnWorkerCacheDir, { recursive: true, force: true }) } catch {} }
 // worker_threads 不终止会吊住事件循环，CLI 评测直接退出
 process.exit(0)
+
+// ---------------------------------------------------------------- WASM root-splitting 并行适配器
+// N 个 worker_threads 各持独立 WASM 实例（独立 TT），交错分配根候选位掩码，
+// 主线程汇总各子集最优。带宽要求：work 本地路径（Node worker 可直接同步加载 wasm 文件）。
+
+async function makeWasmParallelAdapter(mod, label, wasmPath, cfg, threads) {
+  const { Worker } = await import('node:worker_threads')
+  const cacheDir = path.join(process.cwd(), 'node_modules', '.eval-cache')
+  fs.mkdirSync(cacheDir, { recursive: true })
+  const workerSrc = `
+import { readFileSync } from 'node:fs'
+import { parentPort } from 'node:worker_threads'
+const bytes = readFileSync(${JSON.stringify(path.resolve(wasmPath))})
+const { instance } = await WebAssembly.instantiate(bytes, { env: { now: () => Date.now() } })
+const e = instance.exports
+parentPort.on('message', (req) => {
+  try {
+    const cells = new Uint8Array(e.memory.buffer, e.board_buffer(), 225)
+    for (let i = 0; i < 225; i++) cells[i] = req.board[i]
+    if (req.phase === 'subset') {
+      const mv = e.search_best_move_subset(req.color, req.maxDepth, req.timeMs, req.width, req.mask)
+      parentPort.postMessage({ id: req.id, ok: true, mv, score: e.get_score(), depth: e.get_depth(), seldepth: e.get_seldepth(), nodes: e.get_nodes() })
+    } else {
+      // 阶段2：按显式着法列表全窗口精搜（重验证汇总）
+      const movesBuf = new Uint16Array(e.memory.buffer, e.moves_buffer(), 64)
+      for (let i = 0; i < req.moves.length; i++) movesBuf[i] = req.moves[i]
+      const mv = e.search_moves(req.color, req.maxDepth, req.timeMs, req.moves.length)
+      parentPort.postMessage({ id: req.id, ok: true, mv, score: e.get_score(), depth: e.get_depth(), seldepth: e.get_seldepth(), nodes: e.get_nodes() })
+    }
+  } catch (err) {
+    parentPort.postMessage({ id: req.id, ok: false, error: String(err) })
+  }
+})
+`
+  const workerPath = path.join(cacheDir, 'wasm-parallel-worker.mjs')
+  fs.writeFileSync(workerPath, workerSrc)
+
+  const workers = Array.from({ length: threads }, () => new Worker(workerPath))
+  const pending = new Map()
+  let nextId = 0
+  for (const w of workers) {
+    w.on('message', (msg) => {
+      const r = pending.get(msg.id)
+      if (r) { pending.delete(msg.id); r(msg) }
+    })
+  }
+
+  function ask(workerIdx, board, color, timeMs, mask) {
+    return new Promise((resolve) => {
+      const id = nextId++
+      pending.set(id, resolve)
+      workers[workerIdx].postMessage({ id, phase: 'subset', board, color, maxDepth: cfg.maxDepth, timeMs, width: cfg.width, mask })
+    })
+  }
+
+  function verify(workerIdx, board, color, timeMs, moves) {
+    return new Promise((resolve) => {
+      const id = nextId++
+      pending.set(id, resolve)
+      workers[workerIdx].postMessage({ id, phase: 'verify', board, color, maxDepth: cfg.maxDepth, timeMs, moves })
+    })
+  }
+
+  // 两阶段 root-splitting：
+  // 阶段1（并行，60% 预算）：块切分——候选按 quickScore 排序天然"前佳后差"（ordered_candidates 保证），
+  //   worker0（主 worker）拿前 1/threads 的【最佳候选块】深搜，其余 worker 拿剩余块。
+  //   交错切分的教训：均匀混切让每个 worker 都含坏候选，并行算力大量花在单线程本会剪掉的分支上
+  //   （实测 100 局仅 +28）。块切分让主 worker 走单线程等价路径，其余 worker 提供"备选发现"。
+  // 阶段2（40% 预算）：各子集最优着法全窗口重验证（跨子集分数不可比问题，实测 25% 局面需纠偏）
+  return {
+    label: `${label}×${threads}parallel(${path.basename(wasmPath)})`,
+    async pick(board, color, timeMs) {
+      const vct = mod.probeForcedWin(board, color)
+      if (vct >= 0) {
+        return { pos: { x: vct % 15, y: Math.floor(vct / 15) }, score: 999999, depth: 1, seldepth: 1, nodes: 0 }
+      }
+      const t1 = Math.max(50, Math.floor(timeMs * 0.6))
+      const t2 = Math.max(50, timeMs - t1)
+      const jobs = workers.map((_, t) => {
+        // 块切分：worker t 拿连续块 [t*B, (t+1)*B)
+        const B = Math.ceil(cfg.width / threads)
+        let mask = 0n
+        for (let j = t * B; j < Math.min((t + 1) * B, cfg.width); j++) mask |= 1n << BigInt(j)
+        return ask(t, board, color, t1, mask)
+      })
+      const rs = await Promise.all(jobs)
+      // 各子集最优着法（去重）
+      const moves = [...new Set(rs.filter((r) => r && r.ok && r.mv >= 0).map((r) => r.mv))]
+      if (moves.length === 0) return { pos: null, score: 0, depth: 0, seldepth: 0, nodes: 0 }
+      if (moves.length === 1) {
+        const r = rs.find((r) => r && r.ok && r.mv === moves[0])
+        return { pos: { x: moves[0] % 15, y: Math.floor(moves[0] / 15) }, score: r.score, depth: r.depth, seldepth: r.seldepth, nodes: rs.reduce((a, x) => a + (x && x.ok ? x.nodes : 0), 0) }
+      }
+      // 阶段2：全窗口重验证（worker0 已空闲）
+      const v = await verify(0, board, color, t2, moves)
+      const nodes = rs.reduce((a, x) => a + (x && x.ok ? x.nodes : 0), 0) + (v && v.ok ? v.nodes : 0)
+      if (!v || !v.ok || v.mv < 0) {
+        // 重验证失败：退回阶段1最大分
+        const best = rs.reduce((a, b) => (!a || (b && b.ok && b.mv >= 0 && b.score > a.score) ? b : a), null)
+        if (!best) return { pos: null, score: 0, depth: 0, seldepth: 0, nodes }
+        return { pos: { x: best.mv % 15, y: Math.floor(best.mv / 15) }, score: best.score, depth: best.depth, seldepth: best.seldepth, nodes }
+      }
+      return {
+        pos: { x: v.mv % 15, y: Math.floor(v.mv / 15) },
+        score: v.score,
+        depth: v.depth,
+        seldepth: v.seldepth,
+        nodes
+      }
+    }
+  }
+}

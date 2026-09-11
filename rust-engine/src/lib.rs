@@ -113,6 +113,8 @@ static mut RESULT_TIMED_OUT: i32 = 0;
 static mut EVAL_SCORE: i32 = 0;
 /** 搜索到达的最大 ply（含威胁延伸）：反映强制线的真实搜索深度 */
 static mut MAX_PLY: i32 = 0;
+/** search_moves 的根着法列表缓冲（y*15+x 编码，由 JS 写入 moves_buffer） */
+static mut MOVES_BUF: [u16; 64] = [0; 64];
 
 #[no_mangle]
 pub extern "C" fn board_buffer() -> *mut u8 {
@@ -1417,6 +1419,271 @@ pub extern "C" fn search_best_move(color: u32, max_depth: u32, time_ms: u32, wid
         depth += 2;
         // 必胜/必败已证明（MATE 级分值）：继续加深只会找更短的杀法，直接停，
         // 避免找到活四后仍烧满全部时间
+        if best_score >= MATE - 200 || best_score <= -(MATE - 200) {
+            break;
+        }
+    }
+
+    unsafe {
+        RESULT_SCORE = best_score;
+        RESULT_DEPTH = reached_depth;
+        RESULT_NODES = NODES as i32;
+        RESULT_TIMED_OUT = if TIMED_OUT { 1 } else { 0 };
+    }
+    best_move as i32
+}
+
+/// 根子集搜索（root splitting 并行入口）：
+/// 与 search_best_move 相同的初始化与迭代加深，但根节点只搜 mask 指定的候选
+/// （cands 的下标位掩码，bit j = 搜 cands[j]）。供 JS 侧多 Worker 各搜根子集后
+/// 汇总——各实例独立 TT，无锁竞争。mask=0 时退化为全候选（等价 search_best_move）。
+#[no_mangle]
+pub extern "C" fn search_best_move_subset(
+    color: u32,
+    max_depth: u32,
+    time_ms: u32,
+    width: u32,
+    mask: u64,
+) -> i32 {
+    let col = color as u8;
+    unsafe {
+        NODES = 0;
+        TIMED_OUT = false;
+        MAX_PLY = 0;
+        DEADLINE = now() + time_ms as f64;
+        HASH = 0;
+        for i in 0..N {
+            HISTORY[i] = 0;
+            NEAR[i] = 0;
+            if BOARD[i] != 0 {
+                HASH ^= zobrist_at(i, BOARD[i]);
+                let r = (i / 15) as i32;
+                let c = (i % 15) as i32;
+                near_delta(r, c, 1);
+            }
+        }
+        EVAL_SCORE = evaluate(&BOARD);
+        build_five_tables();
+        for i in 0..TT_SIZE {
+            TT[i] = EMPTY_TT;
+        }
+        for i in 0..64 {
+            KILLERS[i] = [0, 0];
+        }
+    }
+
+    let (cands, n) = ordered_candidates(col, width as usize, 0, 0);
+
+    // 即胜检测（与主入口一致）：子集内的制胜点直接返回
+    for i in 0..n {
+        if mask != 0 && (mask >> i) & 1 == 0 {
+            continue;
+        }
+        let ci = cands[i] as usize;
+        let r = (ci / 15) as i32;
+        let c = (ci % 15) as i32;
+        unsafe {
+            BOARD[ci] = col;
+            let win = is_winning_stone(&BOARD, r, c, col);
+            BOARD[ci] = 0;
+            if win {
+                RESULT_SCORE = MATE;
+                RESULT_DEPTH = 1;
+                RESULT_NODES = NODES as i32;
+                RESULT_TIMED_OUT = 0;
+                return ci as i32;
+            }
+        }
+    }
+
+    // 子集打包成连续数组（search_root 需要连续切片）；mask=0 视为全候选
+    let mut subset = [0u16; 64];
+    let mut sn = 0usize;
+    for i in 0..n {
+        if (mask == 0 || (mask >> i) & 1 == 1) && sn < 64 {
+            subset[sn] = cands[i];
+            sn += 1;
+        }
+    }
+    if sn == 0 {
+        unsafe {
+            RESULT_SCORE = -MATE;
+            RESULT_DEPTH = 0;
+            RESULT_NODES = 0;
+            RESULT_TIMED_OUT = 0;
+        }
+        return -1;
+    }
+
+    let mut best_move = subset[0];
+    let mut best_score = -INF;
+    let mut reached_depth = 0;
+
+    let mut depth = 2i32;
+    while depth <= max_depth as i32 {
+        unsafe {
+            if TIMED_OUT {
+                break;
+            }
+        }
+        let mut alpha = -MATE;
+        let mut beta = MATE;
+        if depth > 2 && best_score > -MATE / 2 && best_score < MATE / 2 {
+            alpha = best_score - 200;
+            beta = best_score + 200;
+        }
+        if best_score <= -(MATE - 200) {
+            alpha = -MATE;
+        }
+        let (m, s) = search_root(col, &subset, sn, depth, alpha, beta);
+        if s <= alpha || s >= beta {
+            let (m2, s2) = search_root(col, &subset, sn, depth, -MATE, MATE);
+            unsafe {
+                if !TIMED_OUT {
+                    best_move = m2;
+                    best_score = s2;
+                    reached_depth = depth;
+                }
+            }
+        } else {
+            unsafe {
+                if !TIMED_OUT {
+                    best_move = m;
+                    best_score = s;
+                    reached_depth = depth;
+                }
+            }
+        }
+        depth += 2;
+        if best_score >= MATE - 200 || best_score <= -(MATE - 200) {
+            break;
+        }
+    }
+
+    unsafe {
+        RESULT_SCORE = best_score;
+        RESULT_DEPTH = reached_depth;
+        RESULT_NODES = NODES as i32;
+        RESULT_TIMED_OUT = if TIMED_OUT { 1 } else { 0 };
+    }
+    best_move as i32
+}
+
+/// 根=显式着法坐标列表的搜索（root splitting 第二阶段——重验证汇总）：
+/// moves 为 y*15+x 编码的着法数组（由 JS 写入 moves_buffer），n 为数量。
+/// 与 search_best_move 同构，但根候选固定为给定列表（按给定顺序）。
+/// 用于并行搜索后对少数候选着法做统一全窗口精搜，消除各子集分数不可比的问题。
+#[no_mangle]
+pub extern "C" fn moves_buffer() -> *mut u16 {
+    unsafe { MOVES_BUF.as_mut_ptr() }
+}
+
+#[no_mangle]
+pub extern "C" fn search_moves(color: u32, max_depth: u32, time_ms: u32, n_moves: u32) -> i32 {
+    let col = color as u8;
+    unsafe {
+        NODES = 0;
+        TIMED_OUT = false;
+        MAX_PLY = 0;
+        DEADLINE = now() + time_ms as f64;
+        HASH = 0;
+        for i in 0..N {
+            HISTORY[i] = 0;
+            NEAR[i] = 0;
+            if BOARD[i] != 0 {
+                HASH ^= zobrist_at(i, BOARD[i]);
+                let r = (i / 15) as i32;
+                let c = (i % 15) as i32;
+                near_delta(r, c, 1);
+            }
+        }
+        EVAL_SCORE = evaluate(&BOARD);
+        build_five_tables();
+        for i in 0..TT_SIZE {
+            TT[i] = EMPTY_TT;
+        }
+        for i in 0..64 {
+            KILLERS[i] = [0, 0];
+        }
+    }
+
+    let n = (n_moves as usize).min(64);
+    if n == 0 {
+        unsafe {
+            RESULT_SCORE = -MATE;
+            RESULT_DEPTH = 0;
+            RESULT_NODES = 0;
+            RESULT_TIMED_OUT = 0;
+        }
+        return -1;
+    }
+
+    let mut subset = [0u16; 64];
+    unsafe {
+        for i in 0..n {
+            subset[i] = MOVES_BUF[i];
+        }
+    }
+
+    // 即胜检测
+    for i in 0..n {
+        let ci = subset[i] as usize;
+        let r = (ci / 15) as i32;
+        let c = (ci % 15) as i32;
+        unsafe {
+            BOARD[ci] = col;
+            let win = is_winning_stone(&BOARD, r, c, col);
+            BOARD[ci] = 0;
+            if win {
+                RESULT_SCORE = MATE;
+                RESULT_DEPTH = 1;
+                RESULT_NODES = NODES as i32;
+                RESULT_TIMED_OUT = 0;
+                return ci as i32;
+            }
+        }
+    }
+
+    let mut best_move = subset[0];
+    let mut best_score = -INF;
+    let mut reached_depth = 0;
+
+    let mut depth = 2i32;
+    while depth <= max_depth as i32 {
+        unsafe {
+            if TIMED_OUT {
+                break;
+            }
+        }
+        let mut alpha = -MATE;
+        let mut beta = MATE;
+        if depth > 2 && best_score > -MATE / 2 && best_score < MATE / 2 {
+            alpha = best_score - 200;
+            beta = best_score + 200;
+        }
+        if best_score <= -(MATE - 200) {
+            alpha = -MATE;
+        }
+        let (m, s) = search_root(col, &subset, n, depth, alpha, beta);
+        if s <= alpha || s >= beta {
+            let (m2, s2) = search_root(col, &subset, n, depth, -MATE, MATE);
+            unsafe {
+                if !TIMED_OUT {
+                    best_move = m2;
+                    best_score = s2;
+                    reached_depth = depth;
+                }
+            }
+        } else {
+            unsafe {
+                if !TIMED_OUT {
+                    best_move = m;
+                    best_score = s;
+                    reached_depth = depth;
+                }
+            }
+        }
+        depth += 2;
         if best_score >= MATE - 200 || best_score <= -(MATE - 200) {
             break;
         }
