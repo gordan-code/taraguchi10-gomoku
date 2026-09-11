@@ -358,6 +358,7 @@ async function buildAdapters() {
     if (kind === 'ts') out.push(makeTsAdapter(mod, label, cfg, weights))
     else if (kind === 'wasm') out.push(await makeWasmAdapter(mod, label, cfg[wasmKey], cfg))
     else if (kind === 'wasm-parallel') out.push(await makeWasmParallelAdapter(mod, label, cfg[wasmKey], cfg, cfg.wasmThreads))
+    else if (kind === 'wasm-smp') out.push(await makeWasmSmpAdapter(mod, label, cfg[wasmKey], cfg, cfg.wasmThreads))
     else if (kind === 'nn') out.push(await makeNnAdapter(mod, label, cfg, dir, i === 0 ? cfg.nnModelA : cfg.nnModelB))
     else if (kind === 'rapfi') out.push(makeRapfiAdapter(label, cfg.rapfi))
     else throw new Error(`未知引擎类型: ${kind}`)
@@ -553,6 +554,115 @@ parentPort.on('message', (req) => {
         score: v.score,
         depth: v.depth,
         seldepth: v.seldepth,
+        nodes
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------- Lazy SMP 适配器
+// 共享内存 WASM：主线程持 tid0 实例，N-1 个 worker 持 tid1..N-1 实例（同一共享 Memory）。
+// 每手：写盘 → 广播 'go' → 主实例 search_best_move_smp（阻塞主线程，helpers 并行充实共享 TT）
+// → 读主线程结果 → 等 helpers 完成汇报节点数。
+// 关键（可行性实验结论）：所有消息监听器在任何 await 之前同步挂好（监听器竞态）；
+// worker 的 __stack_pointer 在首个 wasm 调用前由 JS 直接设置（栈区公式 = heap+tid*stride+state+stack）。
+
+async function makeWasmSmpAdapter(mod, label, wasmPath, cfg, threads) {
+  const { Worker } = await import('node:worker_threads')
+  const wasmAbs = path.resolve(wasmPath)
+
+  // 主实例：先行获取布局常量（单线程时刻，默认栈安全）
+  const memory = new WebAssembly.Memory({ initial: 512, maximum: 2048, shared: true })
+  const { instance } = await WebAssembly.instantiate(fs.readFileSync(wasmAbs), {
+    env: { memory, now: () => Date.now() }
+  })
+  const e = instance.exports
+  const heap = Number(e.__heap_base.value)
+  const stateSize = e.smp_state_size()
+  const stackSize = e.smp_stack_size()
+  const stride = stateSize + stackSize
+  e.__stack_pointer.value = heap + 0 * stride + stateSize + stackSize
+  e.smp_init(0, threads, heap, stride)
+
+  // helpers：worker 内不再调用任何 wasm 函数——布局常量全部经 workerData 传入
+  const workerSrc = `
+import { parentPort, workerData } from 'node:worker_threads'
+import { readFileSync } from 'node:fs'
+const bytes = readFileSync(${JSON.stringify(wasmAbs)})
+const memory = workerData.memory
+const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), { env: { memory, now: () => Date.now() } })
+const e = inst.exports
+e.__stack_pointer.value = workerData.stackPtr
+e.smp_init(workerData.tid, workerData.threads, workerData.heap, workerData.stride)
+parentPort.postMessage({ ready: workerData.tid })
+parentPort.on('message', (req) => {
+  if (req.cmd === 'go') {
+    const nodes = e.smp_helper_run(workerData.tid)
+    parentPort.postMessage({ done: nodes, tid: workerData.tid })
+  } else if (req.cmd === 'quit') {
+    process.exit(0)
+  }
+})
+`
+  const cacheDir = path.join(process.cwd(), 'node_modules', '.eval-cache')
+  fs.mkdirSync(cacheDir, { recursive: true })
+  const workerPath = path.join(cacheDir, 'wasm-smp-worker.mjs')
+  fs.writeFileSync(workerPath, workerSrc)
+
+  const helpers = []
+  // 每手一个 done 收集槽：必须等满 helpers.length 个 done（全部收尾）才能进下一手，
+  // 否则残留 helper 会带着旧局面写入共享 TT 污染后续搜索
+  let moveDones = []
+  let doneSignal = null
+  const notify = () => { if (doneSignal && moveDones.length >= helpers.length) { doneSignal(); doneSignal = null } }
+  for (let t = 1; t < threads; t++) {
+    const w = new Worker(workerPath, {
+      workerData: { memory, tid: t, threads, heap, stride, stackPtr: heap + t * stride + stateSize + stackSize }
+    })
+    // 监听器在创建后立即挂好（竞态防护）
+    w.ready = new Promise((res) => {
+      const h = (m) => { if (m.ready === t) { w.off('message', h); res(m) } }
+      w.on('message', h)
+    })
+    w.on('message', (m) => {
+      if (m.done !== undefined) {
+        moveDones.push(m.done)
+        notify()
+      }
+    })
+    helpers.push(w)
+  }
+  await Promise.all(helpers.map((w) => w.ready))
+  const waitAllDones = () =>
+    new Promise((res) => {
+      if (moveDones.length >= helpers.length) return res()
+      doneSignal = res
+      setTimeout(res, 30000) // 护栏：helper 崩溃时不吊死对局
+    })
+
+  const boardBuf = new Uint8Array(memory.buffer, e.board_buffer(), 225)
+
+  return {
+    label: `${label}×${threads}smp(${path.basename(wasmPath)})`,
+    async pick(board, color, timeMs) {
+      const vct = mod.probeForcedWin(board, color)
+      if (vct >= 0) {
+        return { pos: { x: vct % 15, y: Math.floor(vct / 15) }, score: 999999, depth: 1, seldepth: 1, nodes: 0 }
+      }
+      for (let i = 0; i < 225; i++) boardBuf[i] = board[i]
+      // 先发 'go'（helpers 自旋等主线程的 GO 信号），再启动主搜索
+      for (const w of helpers) w.postMessage({ cmd: 'go' })
+      const mv = e.search_best_move_smp(color, cfg.maxDepth, timeMs, cfg.width)
+      // 等全部 helper 收尾（STOP 信号或自身 deadline），收集节点数
+      moveDones = []
+      await waitAllDones()
+      const nodes = e.get_nodes() + moveDones.reduce((a, d) => a + (d || 0), 0)
+      if (mv < 0 || mv >= 225) return { pos: null, score: 0, depth: 0, seldepth: 0, nodes }
+      return {
+        pos: { x: mv % 15, y: Math.floor(mv / 15) },
+        score: e.get_score(),
+        depth: e.get_depth(),
+        seldepth: e.get_seldepth(),
         nodes
       }
     }

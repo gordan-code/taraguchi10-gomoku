@@ -4,6 +4,15 @@ import fs from 'node:fs'
 const bytes = fs.readFileSync('target/wasm32-unknown-unknown/release/renju_engine.wasm')
 const { instance } = await WebAssembly.instantiate(bytes, { env: { now: () => Date.now() } })
 const e = instance.exports
+// ThreadState 重构后：先初始化本实例的线程状态区（单线程 tid=0）
+// 布局：state@heap_base，栈区不必分离（单实例默认栈）
+{
+  const heap = Number(e.__heap_base.value)
+  const stateSize = e.smp_state_size()
+  const stackSize = e.smp_stack_size()
+  const stride = stateSize + stackSize
+  e.smp_init(0, 1, heap, stride)
+}
 const buf = new Uint8Array(e.memory.buffer, e.board_buffer(), 225)
 
 const set = (stones) => {

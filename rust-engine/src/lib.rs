@@ -65,113 +65,167 @@ fn zobrist_at(i: usize, stone: u8) -> u32 {
 const TT_SIZE: usize = 1 << 20;
 const TT_MASK: usize = TT_SIZE - 1;
 
-#[derive(Clone, Copy)]
-struct TTEntry {
-    key: u32,
-    depth: i8,
-    flag: u8,
-    score: i32,
-    best_move: u16,
-}
-const EMPTY_TT: TTEntry = TTEntry { key: 0, depth: 0, flag: 0, score: 0, best_move: 0 };
-
 // ---------------------------------------------------------------- 全局搜索状态
+//
+// Lazy SMP 内存模型：所有 worker 实例共享同一线性内存（JS 以 WebAssembly.Memory
+// shared 创建并注入），但 mutable global 是每实例独立的——THREAD_BASE 即利用这一点：
+// 每实例把自己的"线程状态区"指到共享内存中的专属分区，实现 per-thread 搜索状态。
+// 栈冲突由 JS 在实例化后把每实例的 __stack_pointer（同为每实例 global）移到专属区解决。
+//
+// 共享（数据段，全实例同一地址）：
+//   - ZOBRIST / COLOR_SALT：只读表
+//   - TT_A / TT_B：置换表（双 u64 原子，写序 score→meta(Release)/读序 meta(Acquire)→score，
+//     撕裂读表现为 key 不匹配被探测拒绝——Lazy SMP 标准做法）
+//   - SMP_*：线程协调（GO/STOP/参数）
+// 每线程（THREAD_BASE 指向的 ThreadState）：棋盘/增量表/杀手着/历史/结果。
 
-static mut BOARD: [u8; N] = [0; N];
-static mut HASH: u32 = 0;
-static mut NODES: u32 = 0;
-static mut DEADLINE: f64 = 0.0;
-static mut TIMED_OUT: bool = false;
-static mut TT: [TTEntry; TT_SIZE] = [EMPTY_TT; TT_SIZE];
-static mut KILLERS: [[u16; 2]; 64] = [[0; 2]; 64];
-static mut HISTORY: [i32; N] = [0; N];
-/** 每格半径 2 内的棋子数（含自身）：候选判定从 25 点扫描降为单次读 */
-static mut NEAR: [u16; N] = [0; N];
-/** 四威胁表：FIVE_X[i] = 在 i 落 X 后即成五的窗口数（黑含长连假五，查询时校验恰好五） */
-static mut FIVE_B: [i16; N] = [0; N];
-static mut FIVE_W: [i16; N] = [0; N];
-/** 成五点位掩码（4×u64 覆盖 225 格）：节点入口免 225 格线性扫，只迭代置位位 */
-static mut FIVE_B_MASK: [u64; 4] = [0; 4];
-static mut FIVE_W_MASK: [u64; 4] = [0; 4];
-/** 上表的非零格数（0 = 无任何四威胁，节点入口可跳过细扫） */
-static mut FIVE_B_CELLS: i32 = 0;
-static mut FIVE_W_CELLS: i32 = 0;
-/** 成四点表：F3_X[i] = 经过 i 的（3 子 X + 2 空）窗口数——在 i 落子即成四。
- *  叶节点 VCF 静态延伸的入口：己方成四手是强制手（对手必须挡五点）。 */
-static mut F3_B: [i16; N] = [0; N];
-static mut F3_W: [i16; N] = [0; N];
-static mut F3_B_MASK: [u64; 4] = [0; 4];
-static mut F3_W_MASK: [u64; 4] = [0; 4];
-static mut F3_B_CELLS: i32 = 0;
-static mut F3_W_CELLS: i32 = 0;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-static mut RESULT_SCORE: i32 = 0;
-static mut RESULT_DEPTH: i32 = 0;
-static mut RESULT_NODES: i32 = 0;
-static mut RESULT_TIMED_OUT: i32 = 0;
-/** 增量维护的黑方视角总分（与 evaluate() 全盘重算等价）；落子/撤子时增量更新 */
-static mut EVAL_SCORE: i32 = 0;
-/** 搜索到达的最大 ply（含威胁延伸）：反映强制线的真实搜索深度 */
-static mut MAX_PLY: i32 = 0;
-/** search_moves 的根着法列表缓冲（y*15+x 编码，由 JS 写入 moves_buffer） */
-static mut MOVES_BUF: [u16; 64] = [0; 64];
+#[repr(C)]
+struct ThreadState {
+    BOARD: [u8; N],
+    HASH: u32,
+    NODES: u32,
+    DEADLINE: f64,
+    TIMED_OUT: bool,
+    KILLERS: [[u16; 2]; 64],
+    HISTORY: [i32; N],
+    NEAR: [u16; N],
+    FIVE_B: [i16; N],
+    FIVE_W: [i16; N],
+    FIVE_B_MASK: [u64; 4],
+    FIVE_W_MASK: [u64; 4],
+    FIVE_B_CELLS: i32,
+    FIVE_W_CELLS: i32,
+    F3_B: [i16; N],
+    F3_W: [i16; N],
+    F3_B_MASK: [u64; 4],
+    F3_W_MASK: [u64; 4],
+    F3_B_CELLS: i32,
+    F3_W_CELLS: i32,
+    RESULT_SCORE: i32,
+    RESULT_DEPTH: i32,
+    RESULT_NODES: i32,
+    RESULT_TIMED_OUT: i32,
+    EVAL_SCORE: i32,
+    MAX_PLY: i32,
+    MOVES_BUF: [u16; 64],
+}
+
+/** 每实例线程状态区基址（mutable global → 每 worker 实例独立）。smp_init 设置。 */
+static mut THREAD_BASE: u32 = 0;
+
+fn ts() -> &'static mut ThreadState {
+    unsafe { &mut *(THREAD_BASE as *mut ThreadState) }
+}
+
+// ---- 共享置换表：每槽 try-lock 三字结构（Lazy SMP 并发安全） ----
+// v1（meta 先写）：并发写同槽时读者可把线程1的 score 配线程2的 flag/depth ——
+// 同局面不同深度的条目混配产生非法剪枝（实测棋力 -147 Elo）。
+// v2（key+score 同字）：挡掉异局面混配，但同局面的 score/flag 仍可错配。
+// v3（本版）：每槽一个锁字，probe/store 以 try-lock（CAS 0→1）进入，
+// 锁内读写完整三元组（A/META/无效字），锁竞争即放弃该条目（miss / 丢弃 store）——
+// 无自旋无死锁，最坏情形退化为命中率损失。
+// TT_A[i] = key(32) | score(32)；TT_META[i] = key低24 | depth偏置8 | flag8 | best_move16。
+static TT_LOCK: [AtomicU32; TT_SIZE] = [const { AtomicU32::new(0) }; TT_SIZE];
+static TT_A: [AtomicU64; TT_SIZE] = [const { AtomicU64::new(0) }; TT_SIZE];
+static TT_META: [AtomicU64; TT_SIZE] = [const { AtomicU64::new(0) }; TT_SIZE];
+
+#[inline]
+fn tt_try_lock(i: usize) -> bool {
+    TT_LOCK[i].compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
+}
+
+#[inline]
+fn tt_unlock(i: usize) {
+    TT_LOCK[i].store(0, Ordering::Release);
+}
+
+fn tt_clear() {
+    if SMP_KEEP_TT.load(Ordering::Relaxed) {
+        return;
+    }
+    for i in 0..TT_SIZE {
+        if tt_try_lock(i) {
+            TT_A[i].store(0, Ordering::Relaxed);
+            TT_META[i].store(0, Ordering::Relaxed);
+            tt_unlock(i);
+        }
+    }
+}
+
+// ---- SMP 线程协调（共享） ----
+static SMP_GO: AtomicBool = AtomicBool::new(false);
+/** SMP 模式跳过每手 tt_clear（跨手 TT 复用 = Lazy SMP 主要增益；hash 寻址保证旧条目天然 miss） */
+static SMP_KEEP_TT: AtomicBool = AtomicBool::new(false);
+static SMP_STOP: AtomicBool = AtomicBool::new(false);
+/** [color, max_depth, time_ms, width] */
+static SMP_PARAMS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
 
 #[no_mangle]
 pub extern "C" fn board_buffer() -> *mut u8 {
-    unsafe { BOARD.as_mut_ptr() }
+    let ctx = ts();
+    unsafe { ctx.BOARD.as_mut_ptr() }
 }
 #[no_mangle]
 pub extern "C" fn get_score() -> i32 {
-    unsafe { RESULT_SCORE }
+    let ctx = ts();
+    unsafe { ctx.RESULT_SCORE }
 }
 #[no_mangle]
 pub extern "C" fn get_depth() -> i32 {
-    unsafe { RESULT_DEPTH }
+    let ctx = ts();
+    unsafe { ctx.RESULT_DEPTH }
 }
 #[no_mangle]
 pub extern "C" fn get_nodes() -> i32 {
-    unsafe { RESULT_NODES }
+    let ctx = ts();
+    unsafe { ctx.RESULT_NODES }
 }
 #[no_mangle]
 pub extern "C" fn get_timed_out() -> i32 {
-    unsafe { RESULT_TIMED_OUT }
+    let ctx = ts();
+    unsafe { ctx.RESULT_TIMED_OUT }
 }
 /** 调试：增量评估与全盘重算的差值（0 = 一致）。搜索结束后调用以验证不变量。 */
 #[no_mangle]
 pub extern "C" fn eval_consistency() -> i32 {
-    unsafe { EVAL_SCORE - evaluate(&BOARD) }
+    let ctx = ts();
+    unsafe { ctx.EVAL_SCORE - evaluate(&ctx.BOARD) }
 }
 /** 搜索到达的最大 ply（威胁延伸后可达名义深度数倍） */
 #[no_mangle]
 pub extern "C" fn get_seldepth() -> i32 {
-    unsafe { MAX_PLY }
+    let ctx = ts();
+    unsafe { ctx.MAX_PLY }
 }
 /** 调试：四威胁/成四点表与全盘重算的不一致格数（0 = 一致）。搜索结束后调用。 */
 #[no_mangle]
 pub extern "C" fn five_consistency() -> i32 {
+    let ctx = ts();
     unsafe {
-        let b = FIVE_B;
-        let w = FIVE_W;
-        let bc = FIVE_B_CELLS;
-        let wc = FIVE_W_CELLS;
-        let b3 = F3_B;
-        let w3 = F3_W;
-        let bc3 = F3_B_CELLS;
-        let wc3 = F3_W_CELLS;
-        build_five_tables();
+        let b = ctx.FIVE_B;
+        let w = ctx.FIVE_W;
+        let bc = ctx.FIVE_B_CELLS;
+        let wc = ctx.FIVE_W_CELLS;
+        let b3 = ctx.F3_B;
+        let w3 = ctx.F3_W;
+        let bc3 = ctx.F3_B_CELLS;
+        let wc3 = ctx.F3_W_CELLS;
+        build_five_tables(ctx, );
         let mut bad = 0i32;
         for i in 0..N {
-            if FIVE_B[i] != b[i] || FIVE_W[i] != w[i] {
+            if ctx.FIVE_B[i] != b[i] || ctx.FIVE_W[i] != w[i] {
                 bad += 1;
             }
-            if F3_B[i] != b3[i] || F3_W[i] != w3[i] {
+            if ctx.F3_B[i] != b3[i] || ctx.F3_W[i] != w3[i] {
                 bad += 10000;
             }
         }
-        if FIVE_B_CELLS != bc || FIVE_W_CELLS != wc {
+        if ctx.FIVE_B_CELLS != bc || ctx.FIVE_W_CELLS != wc {
             bad += 1000;
         }
-        if F3_B_CELLS != bc3 || F3_W_CELLS != wc3 {
+        if ctx.F3_B_CELLS != bc3 || ctx.F3_W_CELLS != wc3 {
             bad += 1000_000;
         }
         bad
@@ -541,12 +595,12 @@ fn window_contribution(b: i32, w: i32) -> i32 {
     }
 }
 
-/// BOARD[idx(r,c)] 已从 prev 变为当前值：重算所有经过该点的 5 连窗口，增量更新 EVAL_SCORE。
-/// 落子后调 eval_delta(r, c, 0)；撤子后调 eval_delta(r, c, color)。
-/// 禁手探测的临时放子/撤子不读 EVAL_SCORE，无需成对调用（净变化为零）。
-fn eval_delta(r: i32, c: i32, prev: u8) {
+/// ctx.BOARD[idx(r,c)] 已从 prev 变为当前值：重算所有经过该点的 5 连窗口，增量更新 ctx.EVAL_SCORE。
+/// 落子后调 eval_delta(ctx, r, c, 0)；撤子后调 eval_delta(ctx, r, c, color)。
+/// 禁手探测的临时放子/撤子不读 ctx.EVAL_SCORE，无需成对调用（净变化为零）。
+fn eval_delta(ctx: &mut ThreadState, r: i32, c: i32, prev: u8) {
     unsafe {
-        let new_v = BOARD[idx(r, c)];
+        let new_v = ctx.BOARD[idx(r, c)];
         if prev == new_v {
             return;
         }
@@ -571,7 +625,7 @@ fn eval_delta(r: i32, c: i32, prev: u8) {
                     let kr = sr + dy * k;
                     let kc = sc + dx * k;
                     let ki = idx(kr, kc) as i32;
-                    let v = BOARD[idx(kr, kc)];
+                    let v = ctx.BOARD[idx(kr, kc)];
                     let v_old = if kr == r && kc == c { prev } else { v };
                     let v_new = if kr == r && kc == c { new_v } else { v };
                     if v_old == BLACK {
@@ -596,127 +650,127 @@ fn eval_delta(r: i32, c: i32, prev: u8) {
                 delta += window_contribution(new_b, new_w) - window_contribution(old_b, old_w);
                 // 四威胁表增量：窗口恰好 4 子 + 1 空 → 空点是成五点
                 if old_b == 4 && old_w == 0 {
-                    five_dec(BLACK, old_e1 as usize);
+                    five_dec(ctx, BLACK, old_e1 as usize);
                 }
                 if new_b == 4 && new_w == 0 {
-                    five_inc(BLACK, new_e1 as usize);
+                    five_inc(ctx, BLACK, new_e1 as usize);
                 }
                 if old_w == 4 && old_b == 0 {
-                    five_dec(WHITE, old_e1 as usize);
+                    five_dec(ctx, WHITE, old_e1 as usize);
                 }
                 if new_w == 4 && new_b == 0 {
-                    five_inc(WHITE, new_e1 as usize);
+                    five_inc(ctx, WHITE, new_e1 as usize);
                 }
                 // 成四点表增量：窗口恰好 3 子 + 2 空 → 两个空点都是成四点
                 if old_b == 3 && old_w == 0 {
-                    f3_dec(BLACK, old_e1 as usize);
+                    f3_dec(ctx, BLACK, old_e1 as usize);
                     if old_e2 >= 0 {
-                        f3_dec(BLACK, old_e2 as usize);
+                        f3_dec(ctx, BLACK, old_e2 as usize);
                     }
                 }
                 if new_b == 3 && new_w == 0 {
-                    f3_inc(BLACK, new_e1 as usize);
+                    f3_inc(ctx, BLACK, new_e1 as usize);
                     if new_e2 >= 0 {
-                        f3_inc(BLACK, new_e2 as usize);
+                        f3_inc(ctx, BLACK, new_e2 as usize);
                     }
                 }
                 if old_w == 3 && old_b == 0 {
-                    f3_dec(WHITE, old_e1 as usize);
+                    f3_dec(ctx, WHITE, old_e1 as usize);
                     if old_e2 >= 0 {
-                        f3_dec(WHITE, old_e2 as usize);
+                        f3_dec(ctx, WHITE, old_e2 as usize);
                     }
                 }
                 if new_w == 3 && new_b == 0 {
-                    f3_inc(WHITE, new_e1 as usize);
+                    f3_inc(ctx, WHITE, new_e1 as usize);
                     if new_e2 >= 0 {
-                        f3_inc(WHITE, new_e2 as usize);
+                        f3_inc(ctx, WHITE, new_e2 as usize);
                     }
                 }
             }
         }
-        EVAL_SCORE += delta;
+        ctx.EVAL_SCORE += delta;
     }
 }
 
-fn five_inc(color: u8, e: usize) {
+fn five_inc(ctx: &mut ThreadState, color: u8, e: usize) {
     unsafe {
         if color == BLACK {
-            FIVE_B[e] += 1;
-            if FIVE_B[e] == 1 {
-                FIVE_B_CELLS += 1;
-                FIVE_B_MASK[e >> 6] |= 1u64 << (e & 63);
+            ctx.FIVE_B[e] += 1;
+            if ctx.FIVE_B[e] == 1 {
+                ctx.FIVE_B_CELLS += 1;
+                ctx.FIVE_B_MASK[e >> 6] |= 1u64 << (e & 63);
             }
         } else {
-            FIVE_W[e] += 1;
-            if FIVE_W[e] == 1 {
-                FIVE_W_CELLS += 1;
-                FIVE_W_MASK[e >> 6] |= 1u64 << (e & 63);
+            ctx.FIVE_W[e] += 1;
+            if ctx.FIVE_W[e] == 1 {
+                ctx.FIVE_W_CELLS += 1;
+                ctx.FIVE_W_MASK[e >> 6] |= 1u64 << (e & 63);
             }
         }
     }
 }
 
-fn five_dec(color: u8, e: usize) {
+fn five_dec(ctx: &mut ThreadState, color: u8, e: usize) {
     unsafe {
         if color == BLACK {
-            FIVE_B[e] -= 1;
-            if FIVE_B[e] == 0 {
-                FIVE_B_CELLS -= 1;
-                FIVE_B_MASK[e >> 6] &= !(1u64 << (e & 63));
+            ctx.FIVE_B[e] -= 1;
+            if ctx.FIVE_B[e] == 0 {
+                ctx.FIVE_B_CELLS -= 1;
+                ctx.FIVE_B_MASK[e >> 6] &= !(1u64 << (e & 63));
             }
         } else {
-            FIVE_W[e] -= 1;
-            if FIVE_W[e] == 0 {
-                FIVE_W_CELLS -= 1;
-                FIVE_W_MASK[e >> 6] &= !(1u64 << (e & 63));
+            ctx.FIVE_W[e] -= 1;
+            if ctx.FIVE_W[e] == 0 {
+                ctx.FIVE_W_CELLS -= 1;
+                ctx.FIVE_W_MASK[e >> 6] &= !(1u64 << (e & 63));
             }
         }
     }
 }
 
-fn f3_inc(color: u8, e: usize) {
+fn f3_inc(ctx: &mut ThreadState, color: u8, e: usize) {
     unsafe {
         if color == BLACK {
-            F3_B[e] += 1;
-            if F3_B[e] == 1 {
-                F3_B_CELLS += 1;
-                F3_B_MASK[e >> 6] |= 1u64 << (e & 63);
+            ctx.F3_B[e] += 1;
+            if ctx.F3_B[e] == 1 {
+                ctx.F3_B_CELLS += 1;
+                ctx.F3_B_MASK[e >> 6] |= 1u64 << (e & 63);
             }
         } else {
-            F3_W[e] += 1;
-            if F3_W[e] == 1 {
-                F3_W_CELLS += 1;
-                F3_W_MASK[e >> 6] |= 1u64 << (e & 63);
+            ctx.F3_W[e] += 1;
+            if ctx.F3_W[e] == 1 {
+                ctx.F3_W_CELLS += 1;
+                ctx.F3_W_MASK[e >> 6] |= 1u64 << (e & 63);
             }
         }
     }
 }
 
-fn f3_dec(color: u8, e: usize) {
+fn f3_dec(ctx: &mut ThreadState, color: u8, e: usize) {
     unsafe {
         if color == BLACK {
-            F3_B[e] -= 1;
-            if F3_B[e] == 0 {
-                F3_B_CELLS -= 1;
-                F3_B_MASK[e >> 6] &= !(1u64 << (e & 63));
+            ctx.F3_B[e] -= 1;
+            if ctx.F3_B[e] == 0 {
+                ctx.F3_B_CELLS -= 1;
+                ctx.F3_B_MASK[e >> 6] &= !(1u64 << (e & 63));
             }
         } else {
-            F3_W[e] -= 1;
-            if F3_W[e] == 0 {
-                F3_W_CELLS -= 1;
-                F3_W_MASK[e >> 6] &= !(1u64 << (e & 63));
+            ctx.F3_W[e] -= 1;
+            if ctx.F3_W[e] == 0 {
+                ctx.F3_W_CELLS -= 1;
+                ctx.F3_W_MASK[e >> 6] &= !(1u64 << (e & 63));
             }
         }
     }
 }
 
 /** 增量总分的行棋方视角值（正 = 当前行棋方优） */
-fn eval_side(color: u8) -> i32 {
+fn eval_side(ctx: &mut ThreadState, color: u8) -> i32 {
     unsafe {
         if color == BLACK {
-            EVAL_SCORE
+            ctx.EVAL_SCORE
         } else {
-            -EVAL_SCORE
+            -ctx.EVAL_SCORE
         }
     }
 }
@@ -728,12 +782,12 @@ struct FiveIter {
     bits: u64,
 }
 impl FiveIter {
-    fn new(color: u8) -> FiveIter {
+    fn new(ctx: &mut ThreadState, color: u8) -> FiveIter {
         unsafe {
             if color == BLACK {
-                FiveIter { mask: FIVE_B_MASK, w: 0, bits: 0 }
+                FiveIter { mask: ctx.FIVE_B_MASK, w: 0, bits: 0 }
             } else {
-                FiveIter { mask: FIVE_W_MASK, w: 0, bits: 0 }
+                FiveIter { mask: ctx.FIVE_W_MASK, w: 0, bits: 0 }
             }
         }
     }
@@ -753,53 +807,53 @@ impl FiveIter {
 }
 
 /** 从空表全量重建四威胁/成四点表（search_best_move 入口一次性调用） */
-fn build_five_tables() {
+fn build_five_tables(ctx: &mut ThreadState, ) {
     unsafe {
-        FIVE_B = [0; N];
-        FIVE_W = [0; N];
-        FIVE_B_MASK = [0; 4];
-        FIVE_W_MASK = [0; 4];
-        FIVE_B_CELLS = 0;
-        FIVE_W_CELLS = 0;
-        F3_B = [0; N];
-        F3_W = [0; N];
-        F3_B_MASK = [0; 4];
-        F3_W_MASK = [0; 4];
-        F3_B_CELLS = 0;
-        F3_W_CELLS = 0;
+        ctx.FIVE_B = [0; N];
+        ctx.FIVE_W = [0; N];
+        ctx.FIVE_B_MASK = [0; 4];
+        ctx.FIVE_W_MASK = [0; 4];
+        ctx.FIVE_B_CELLS = 0;
+        ctx.FIVE_W_CELLS = 0;
+        ctx.F3_B = [0; N];
+        ctx.F3_W = [0; N];
+        ctx.F3_B_MASK = [0; 4];
+        ctx.F3_W_MASK = [0; 4];
+        ctx.F3_B_CELLS = 0;
+        ctx.F3_W_CELLS = 0;
         // 与 evaluate() 相同的四个窗口族
         for r in 0..SIZE {
             for c in 0..(SIZE - 4) {
-                count_window_five(r, c, 0, 1);
+                count_window_five(ctx, r, c, 0, 1);
             }
         }
         for r in 0..(SIZE - 4) {
             for c in 0..SIZE {
-                count_window_five(r, c, 1, 0);
+                count_window_five(ctx, r, c, 1, 0);
             }
         }
         for r in 0..(SIZE - 4) {
             for c in 0..(SIZE - 4) {
-                count_window_five(r, c, 1, 1);
+                count_window_five(ctx, r, c, 1, 1);
             }
         }
         for r in 0..(SIZE - 4) {
             for c in 4..SIZE {
-                count_window_five(r, c, 1, -1);
+                count_window_five(ctx, r, c, 1, -1);
             }
         }
     }
 }
 
 /// 统计起点 (r,c)、步长 (dy,dx) 的 5 连窗口：4+1 空记成五点，3+2 空记成四点
-fn count_window_five(r: i32, c: i32, dy: i32, dx: i32) {
+fn count_window_five(ctx: &mut ThreadState, r: i32, c: i32, dy: i32, dx: i32) {
     unsafe {
         let mut b = 0;
         let mut w = 0;
         let mut e1: i32 = -1;
         let mut e2: i32 = -1;
         for k in 0..5i32 {
-            let v = BOARD[idx(r + dy * k, c + dx * k)];
+            let v = ctx.BOARD[idx(r + dy * k, c + dx * k)];
             if v == BLACK {
                 b += 1;
             } else if v == WHITE {
@@ -811,21 +865,21 @@ fn count_window_five(r: i32, c: i32, dy: i32, dx: i32) {
             }
         }
         if b == 4 && w == 0 {
-            five_inc(BLACK, e1 as usize);
+            five_inc(ctx, BLACK, e1 as usize);
         }
         if w == 4 && b == 0 {
-            five_inc(WHITE, e1 as usize);
+            five_inc(ctx, WHITE, e1 as usize);
         }
         if b == 3 && w == 0 {
-            f3_inc(BLACK, e1 as usize);
+            f3_inc(ctx, BLACK, e1 as usize);
             if e2 >= 0 {
-                f3_inc(BLACK, e2 as usize);
+                f3_inc(ctx, BLACK, e2 as usize);
             }
         }
         if w == 3 && b == 0 {
-            f3_inc(WHITE, e1 as usize);
+            f3_inc(ctx, WHITE, e1 as usize);
             if e2 >= 0 {
-                f3_inc(WHITE, e2 as usize);
+                f3_inc(ctx, WHITE, e2 as usize);
             }
         }
     }
@@ -834,7 +888,7 @@ fn count_window_five(r: i32, c: i32, dy: i32, dx: i32) {
 // ---------------------------------------------------------------- 候选生成/排序
 
 /** 半径 2 邻域计数维护：落子后调用（放置 25 个 +1），撤子前调用配对的减量 */
-fn near_delta(r: i32, c: i32, d: i32) {
+fn near_delta(ctx: &mut ThreadState, r: i32, c: i32, d: i32) {
     unsafe {
         for dy in -2..=2 {
             for dx in -2..=2 {
@@ -842,7 +896,7 @@ fn near_delta(r: i32, c: i32, d: i32) {
                 let cc = c + dx;
                 if in_bounds(rr, cc) {
                     let i = idx(rr, cc);
-                    NEAR[i] = (NEAR[i] as i32 + d) as u16;
+                    ctx.NEAR[i] = (ctx.NEAR[i] as i32 + d) as u16;
                 }
             }
         }
@@ -914,7 +968,7 @@ fn quick_score(board: &[u8], r: i32, c: i32, color: u8) -> i32 {
     shape_score(board, r, c, color) + (3 * shape_score(board, r, c, opp)) / 4
 }
 
-fn ordered_candidates(color: u8, width: usize, tt_move: u16, ply: usize) -> ([u16; N], usize) {
+fn ordered_candidates(ctx: &mut ThreadState, color: u8, width: usize, tt_move: u16, ply: usize) -> ([u16; N], usize) {
     let width = if width == 0 { 1 } else { width };
     let mut cands = [0u16; N];
     let mut scores = [0i32; N];
@@ -923,19 +977,19 @@ fn ordered_candidates(color: u8, width: usize, tt_move: u16, ply: usize) -> ([u1
         for r in 0..SIZE {
             for c in 0..SIZE {
                 let i = idx(r, c);
-                if BOARD[i] != 0 || NEAR[i] == 0 {
+                if ctx.BOARD[i] != 0 || ctx.NEAR[i] == 0 {
                     continue;
                 }
                 let ci = i as u16;
-                let mut s = quick_score(&BOARD, r, c, color) * 16;
+                let mut s = quick_score(&ctx.BOARD, r, c, color) * 16;
                 if ci == tt_move {
                     s += 1 << 30;
-                } else if ci == KILLERS[ply][0] {
+                } else if ci == ctx.KILLERS[ply][0] {
                     s += 1 << 28;
-                } else if ci == KILLERS[ply][1] {
+                } else if ci == ctx.KILLERS[ply][1] {
                     s += 1 << 27;
                 }
-                s += HISTORY[i] >> 4;
+                s += ctx.HISTORY[i] >> 4;
                 cands[n] = ci;
                 scores[n] = s;
                 n += 1;
@@ -989,9 +1043,9 @@ fn ordered_candidates(color: u8, width: usize, tt_move: u16, ply: usize) -> ([u1
             let r = (ci / 15) as i32;
             let c = (ci % 15) as i32;
             unsafe {
-                BOARD[ci] = BLACK;
-                let forbidden = check_forbidden(&BOARD, r, c, 0);
-                BOARD[ci] = 0;
+                ctx.BOARD[ci] = BLACK;
+                let forbidden = check_forbidden(&ctx.BOARD, r, c, 0);
+                ctx.BOARD[ci] = 0;
                 if forbidden {
                     continue;
                 }
@@ -1011,56 +1065,79 @@ fn ordered_candidates(color: u8, width: usize, tt_move: u16, ply: usize) -> ([u1
 // ---------------------------------------------------------------- 搜索
 
 fn tt_probe(hash: u32, depth: i32, alpha: i32, beta: i32) -> (i32, u16) {
-    unsafe {
-        let mut i = (hash as usize) & TT_MASK;
-        for _ in 0..4 {
-            let e = TT[i];
-            if e.key == hash && e.depth as i32 >= depth {
-                let hit = match e.flag {
-                    0 => true,
-                    1 => e.score >= beta,
-                    2 => e.score <= alpha,
-                    _ => false,
-                };
-                if hit {
-                    return (e.score, e.best_move);
+    let mut i = (hash as usize) & TT_MASK;
+    for _ in 0..4 {
+        if tt_try_lock(i) {
+            let a = TT_A[i].load(Ordering::Relaxed);
+            let key = a as u32;
+            let mut result = (INF, 0);
+            if key == hash {
+                let c = TT_META[i].load(Ordering::Relaxed);
+                if (c & 0xffffff) == ((hash as u64) & 0xffffff) {
+                    let d = (((c >> 24) & 0xff) as i32) - 128;
+                    if d >= depth {
+                        let flag = ((c >> 32) & 0xff) as u8;
+                        let score = (a >> 32) as u32 as i32;
+                        let hit = match flag {
+                            0 => true,
+                            1 => score >= beta,
+                            2 => score <= alpha,
+                            _ => false,
+                        };
+                        if hit {
+                            let best_move = ((c >> 48) & 0xffff) as u16;
+                            result = (score, best_move);
+                        }
+                    }
                 }
             }
-            i = (i + 1) & TT_MASK;
+            tt_unlock(i);
+            if result.0 != INF {
+                return result;
+            }
         }
+        i = (i + 1) & TT_MASK;
     }
     (INF, 0)
 }
 
 fn tt_store(hash: u32, depth: i32, flag: u8, score: i32, best_move: u16) {
-    unsafe {
-        let i = (hash as usize) & TT_MASK;
-        TT[i] = TTEntry { key: hash, depth: depth as i8, flag, score, best_move };
+    let i = (hash as usize) & TT_MASK;
+    if !tt_try_lock(i) {
+        return; // 槽位争用：丢弃本次 store（Lazy SMP 下无害）
     }
+    let meta = ((hash as u64) & 0xffffff)
+        | ((((depth + 128) as u64) & 0xff) << 24)
+        | ((flag as u64) << 32)
+        | ((best_move as u64) << 48);
+    TT_META[i].store(meta, Ordering::Relaxed);
+    let a = (hash as u64) | ((score as u32 as u64) << 32);
+    TT_A[i].store(a, Ordering::Relaxed);
+    tt_unlock(i);
 }
 
-fn negamax(color: u8, depth: i32, alpha: i32, beta: i32, ply: i32) -> i32 {
+fn negamax(ctx: &mut ThreadState, color: u8, depth: i32, alpha: i32, beta: i32, ply: i32) -> i32 {
     unsafe {
-        NODES += 1;
-        if ply > MAX_PLY {
-            MAX_PLY = ply;
+        ctx.NODES += 1;
+        if ply > ctx.MAX_PLY {
+            ctx.MAX_PLY = ply;
         }
-        if NODES & 1023 == 0 && now() > DEADLINE {
-            TIMED_OUT = true;
+        if ctx.NODES & 1023 == 0 && now() > ctx.DEADLINE {
+            ctx.TIMED_OUT = true;
         }
-        if TIMED_OUT {
+        if ctx.TIMED_OUT {
             // 软超时：立即返回增量维护的静态分，不再递归更深
-            let e = EVAL_SCORE;
+            let e = ctx.EVAL_SCORE;
             return if color == BLACK { e } else { -e };
         }
         // 强制线硬上限：威胁延伸不扣深度，用 ply 封顶保证递归与杀手表下标有界
         if ply >= 62 {
-            let e = EVAL_SCORE;
+            let e = ctx.EVAL_SCORE;
             return if color == BLACK { e } else { -e };
         }
     }
     let opp = if color == BLACK { WHITE } else { BLACK };
-    let hash = unsafe { HASH ^ COLOR_SALT[color as usize] };
+    let hash = unsafe { ctx.HASH ^ COLOR_SALT[color as usize] };
 
     let (tt_score, tt_move) = tt_probe(hash, depth, alpha, beta);
     if tt_score != INF {
@@ -1072,31 +1149,31 @@ fn negamax(color: u8, depth: i32, alpha: i32, beta: i32, ply: i32) -> i32 {
     // 对方恰 1 个 → 唯一挡点强制应手，且不扣深度（威胁延伸：冲四连招可搜 20+ 层）
     unsafe {
         let (my_cells, opp_cells) = if color == BLACK {
-            (FIVE_B_CELLS, FIVE_W_CELLS)
+            (ctx.FIVE_B_CELLS, ctx.FIVE_W_CELLS)
         } else {
-            (FIVE_W_CELLS, FIVE_B_CELLS)
+            (ctx.FIVE_W_CELLS, ctx.FIVE_B_CELLS)
         };
         if my_cells > 0 {
-            let mut it = FiveIter::new(color);
+            let mut it = FiveIter::new(ctx, color);
             while let Some(i) = it.next_cell() {
-                if BOARD[i] != 0 {
+                if ctx.BOARD[i] != 0 {
                     continue;
                 }
                 // 黑方的成五点须恰好五连（长连不算胜，是假五）
-                if color == WHITE || find_winning_line(&BOARD, (i / 15) as i32, (i % 15) as i32, BLACK, true) {
+                if color == WHITE || find_winning_line(&ctx.BOARD, (i / 15) as i32, (i % 15) as i32, BLACK, true) {
                     return MATE - ply;
                 }
             }
         }
         if opp_cells > 0 {
-            let mut it = FiveIter::new(opp);
+            let mut it = FiveIter::new(ctx, opp);
             let (mut cnt, mut pt) = (0i32, 0usize);
             while let Some(i) = it.next_cell() {
-                if BOARD[i] != 0 {
+                if ctx.BOARD[i] != 0 {
                     continue;
                 }
                 // 对方是黑时同样校验假五
-                if color == WHITE && !find_winning_line(&BOARD, (i / 15) as i32, (i % 15) as i32, BLACK, true) {
+                if color == WHITE && !find_winning_line(&ctx.BOARD, (i / 15) as i32, (i % 15) as i32, BLACK, true) {
                     continue;
                 }
                 cnt += 1;
@@ -1112,23 +1189,23 @@ fn negamax(color: u8, depth: i32, alpha: i32, beta: i32, ply: i32) -> i32 {
                 let r = (pt / 15) as i32;
                 let c = (pt % 15) as i32;
                 if color == BLACK {
-                    BOARD[pt] = BLACK;
-                    let forbidden = check_forbidden(&BOARD, r, c, 0);
-                    BOARD[pt] = 0;
+                    ctx.BOARD[pt] = BLACK;
+                    let forbidden = check_forbidden(&ctx.BOARD, r, c, 0);
+                    ctx.BOARD[pt] = 0;
                     if forbidden {
                         // 唯一挡点对黑是禁手 → 黑无法合法防守 → 败
                         return -MATE + ply + 1;
                     }
                 }
-                BOARD[pt] = color;
-                HASH ^= zobrist_at(pt, color);
-                eval_delta(r, c, 0);
-                near_delta(r, c, 1);
-                let val = -negamax(opp, depth, -beta, -alpha, ply + 1);
-                near_delta(r, c, -1);
-                HASH ^= zobrist_at(pt, color);
-                BOARD[pt] = 0;
-                eval_delta(r, c, color);
+                ctx.BOARD[pt] = color;
+                ctx.HASH ^= zobrist_at(pt, color);
+                eval_delta(ctx, r, c, 0);
+                near_delta(ctx, r, c, 1);
+                let val = -negamax(ctx, opp, depth, -beta, -alpha, ply + 1);
+                near_delta(ctx, r, c, -1);
+                ctx.HASH ^= zobrist_at(pt, color);
+                ctx.BOARD[pt] = 0;
+                eval_delta(ctx, r, c, color);
                 return val;
             }
         }
@@ -1140,46 +1217,46 @@ fn negamax(color: u8, depth: i32, alpha: i32, beta: i32, ply: i32) -> i32 {
         // 只延伸成四手并让强制挡点机制接力，冲四连招（VCF）在叶节点精确解析，
         // 消除地平线截断误差。链值与静态评估取 max（stand-pat）。
         // depth 负数计_VCF_QMAX 为攻击手预算，防止攻击树无界爆炸。
-        let my_f3_cells = unsafe { if color == BLACK { F3_B_CELLS } else { F3_W_CELLS } };
+        let my_f3_cells = unsafe { if color == BLACK { ctx.F3_B_CELLS } else { ctx.F3_W_CELLS } };
         if my_f3_cells == 0 || depth <= -VCF_QMAX {
-            let e = unsafe { EVAL_SCORE };
+            let e = unsafe { ctx.EVAL_SCORE };
             return if color == BLACK { e } else { -e };
         }
-        let stand = eval_side(color);
+        let stand = eval_side(ctx, color);
         let mut best = stand;
         let mut a = alpha;
         let mut tried = 0usize;
         unsafe {
-            let mask = if color == BLACK { F3_B_MASK } else { F3_W_MASK };
+            let mask = if color == BLACK { ctx.F3_B_MASK } else { ctx.F3_W_MASK };
             let mut it = FiveIter { mask, w: 0, bits: 0 };
             while tried < 2 {
                 let i = match it.next_cell() {
                     Some(i) => i,
                     None => break,
                 };
-                if BOARD[i] != 0 {
+                if ctx.BOARD[i] != 0 {
                     continue;
                 }
                 let r = (i / 15) as i32;
                 let c = (i % 15) as i32;
                 if color == BLACK {
-                    BOARD[i] = BLACK;
-                    let forbidden = check_forbidden(&BOARD, r, c, 0);
-                    BOARD[i] = 0;
+                    ctx.BOARD[i] = BLACK;
+                    let forbidden = check_forbidden(&ctx.BOARD, r, c, 0);
+                    ctx.BOARD[i] = 0;
                     if forbidden {
                         continue;
                     }
                 }
                 tried += 1;
-                BOARD[i] = color;
-                HASH ^= zobrist_at(i, color);
-                eval_delta(r, c, 0);
-                near_delta(r, c, 1);
-                let val = -negamax(opp, depth - 1, -beta, -a, ply + 1);
-                near_delta(r, c, -1);
-                HASH ^= zobrist_at(i, color);
-                BOARD[i] = 0;
-                eval_delta(r, c, color);
+                ctx.BOARD[i] = color;
+                ctx.HASH ^= zobrist_at(i, color);
+                eval_delta(ctx, r, c, 0);
+                near_delta(ctx, r, c, 1);
+                let val = -negamax(ctx, opp, depth - 1, -beta, -a, ply + 1);
+                near_delta(ctx, r, c, -1);
+                ctx.HASH ^= zobrist_at(i, color);
+                ctx.BOARD[i] = 0;
+                eval_delta(ctx, r, c, color);
                 if val > best {
                     best = val;
                 }
@@ -1196,7 +1273,7 @@ fn negamax(color: u8, depth: i32, alpha: i32, beta: i32, ply: i32) -> i32 {
 
     // 内部宽度 16：α-β 的有效分支约 √width，从 24 收窄到 16 节点数约降 5 倍；
     // 对打实测与 24 等胜率且节点率高 35%
-    let (cands, n) = ordered_candidates(color, 16, tt_move, ply as usize);
+    let (cands, n) = ordered_candidates(ctx, color, 16, tt_move, ply as usize);
     if n == 0 {
         return if color == BLACK { -MATE + ply } else { MATE - ply };
     }
@@ -1210,33 +1287,33 @@ fn negamax(color: u8, depth: i32, alpha: i32, beta: i32, ply: i32) -> i32 {
         let r = (ci / 15) as i32;
         let c = (ci % 15) as i32;
         unsafe {
-            BOARD[ci] = color;
-            HASH ^= zobrist_at(ci, color);
-            eval_delta(r, c, 0);
-            near_delta(r, c, 1);
+            ctx.BOARD[ci] = color;
+            ctx.HASH ^= zobrist_at(ci, color);
+            eval_delta(ctx, r, c, 0);
+            near_delta(ctx, r, c, 1);
         }
         let mut val;
-        if is_winning_stone(unsafe { &BOARD }, r, c, color) {
+        if is_winning_stone(unsafe { &ctx.BOARD }, r, c, color) {
             val = MATE - ply;
         } else if first {
-            val = -negamax(opp, depth - 1, -beta, -a, ply + 1);
+            val = -negamax(ctx, opp, depth - 1, -beta, -a, ply + 1);
             first = false;
         } else {
             // LMR（迟到着法降深）：安静节点（双方均无成五威胁）的靠后着法先用
             // depth-2 零窗口试探，fail-high 再全深重搜。战术区域（四表非零）不降；
             // 对打实测与不降深等胜率但深度更高（8 局 4:4，10s 深度 10 vs 8）。
-            let quiet = unsafe { FIVE_B_CELLS == 0 && FIVE_W_CELLS == 0 };
+            let quiet = unsafe { ctx.FIVE_B_CELLS == 0 && ctx.FIVE_W_CELLS == 0 };
             let reduction = if quiet && depth >= 3 && i >= 4 { 2 } else { 1 };
-            val = -negamax(opp, depth - reduction, -(a + 1), -a, ply + 1);
+            val = -negamax(ctx, opp, depth - reduction, -(a + 1), -a, ply + 1);
             if val > a && val < beta {
-                val = -negamax(opp, depth - 1, -beta, -a, ply + 1);
+                val = -negamax(ctx, opp, depth - 1, -beta, -a, ply + 1);
             }
         }
         unsafe {
-            near_delta(r, c, -1);
-            HASH ^= zobrist_at(ci, color);
-            BOARD[ci] = 0;
-            eval_delta(r, c, color);
+            near_delta(ctx, r, c, -1);
+            ctx.HASH ^= zobrist_at(ci, color);
+            ctx.BOARD[ci] = 0;
+            eval_delta(ctx, r, c, color);
         }
         if val > best {
             best = val;
@@ -1247,12 +1324,12 @@ fn negamax(color: u8, depth: i32, alpha: i32, beta: i32, ply: i32) -> i32 {
         }
         if a >= beta {
             unsafe {
-                let k = &mut KILLERS[ply as usize];
+                let k = &mut ctx.KILLERS[ply as usize];
                 if k[0] != cands[i] {
                     k[1] = k[0];
                     k[0] = cands[i];
                 }
-                HISTORY[ci] += depth;
+                ctx.HISTORY[ci] += depth;
             }
             break;
         }
@@ -1269,7 +1346,7 @@ fn negamax(color: u8, depth: i32, alpha: i32, beta: i32, ply: i32) -> i32 {
     best
 }
 
-fn search_root(color: u8, cands: &[u16], n: usize, depth: i32, alpha: i32, beta: i32) -> (u16, i32) {
+fn search_root(ctx: &mut ThreadState, color: u8, cands: &[u16], n: usize, depth: i32, alpha: i32, beta: i32) -> (u16, i32) {
     let opp = if color == BLACK { WHITE } else { BLACK };
     let mut a = alpha;
     let mut best_move = cands[0];
@@ -1283,27 +1360,27 @@ fn search_root(color: u8, cands: &[u16], n: usize, depth: i32, alpha: i32, beta:
         let r = (ci / 15) as i32;
         let c = (ci % 15) as i32;
         unsafe {
-            BOARD[ci] = color;
-            HASH ^= zobrist_at(ci, color);
-            eval_delta(r, c, 0);
-            near_delta(r, c, 1);
+            ctx.BOARD[ci] = color;
+            ctx.HASH ^= zobrist_at(ci, color);
+            eval_delta(ctx, r, c, 0);
+            near_delta(ctx, r, c, 1);
         }
         let mut val;
-        if is_winning_stone(unsafe { &BOARD }, r, c, color) {
+        if is_winning_stone(unsafe { &ctx.BOARD }, r, c, color) {
             val = MATE;
         } else if j == 0 || all_losing {
-            val = -negamax(opp, depth - 1, -beta, -a, 1);
+            val = -negamax(ctx, opp, depth - 1, -beta, -a, 1);
         } else {
-            val = -negamax(opp, depth - 1, -(a + 1), -a, 1);
+            val = -negamax(ctx, opp, depth - 1, -(a + 1), -a, 1);
             if val > a && val < beta {
-                val = -negamax(opp, depth - 1, -beta, -a, 1);
+                val = -negamax(ctx, opp, depth - 1, -beta, -a, 1);
             }
         }
         unsafe {
-            near_delta(r, c, -1);
-            HASH ^= zobrist_at(ci, color);
-            BOARD[ci] = 0;
-            eval_delta(r, c, color);
+            near_delta(ctx, r, c, -1);
+            ctx.HASH ^= zobrist_at(ci, color);
+            ctx.BOARD[ci] = 0;
+            eval_delta(ctx, r, c, color);
         }
         if val > best_score {
             best_score = val;
@@ -1318,48 +1395,47 @@ fn search_root(color: u8, cands: &[u16], n: usize, depth: i32, alpha: i32, beta:
 
 #[no_mangle]
 pub extern "C" fn search_best_move(color: u32, max_depth: u32, time_ms: u32, width: u32) -> i32 {
+    let ctx = ts();
     let col = color as u8;
     unsafe {
-        NODES = 0;
-        TIMED_OUT = false;
-        MAX_PLY = 0;
-        DEADLINE = now() + time_ms as f64;
-        HASH = 0;
+        ctx.NODES = 0;
+        ctx.TIMED_OUT = false;
+        ctx.MAX_PLY = 0;
+        ctx.DEADLINE = now() + time_ms as f64;
+        ctx.HASH = 0;
         for i in 0..N {
-            HISTORY[i] = 0;
-            NEAR[i] = 0;
-            if BOARD[i] != 0 {
-                HASH ^= zobrist_at(i, BOARD[i]);
+            ctx.HISTORY[i] = 0;
+            ctx.NEAR[i] = 0;
+            if ctx.BOARD[i] != 0 {
+                ctx.HASH ^= zobrist_at(i, ctx.BOARD[i]);
                 let r = (i / 15) as i32;
                 let c = (i % 15) as i32;
-                near_delta(r, c, 1);
+                near_delta(ctx, r, c, 1);
             }
         }
-        EVAL_SCORE = evaluate(&BOARD);
-        build_five_tables();
-        for i in 0..TT_SIZE {
-            TT[i] = EMPTY_TT;
-        }
+        ctx.EVAL_SCORE = evaluate(&ctx.BOARD);
+        build_five_tables(ctx, );
+        tt_clear();
         for i in 0..64 {
-            KILLERS[i] = [0, 0];
+            ctx.KILLERS[i] = [0, 0];
         }
     }
 
-    let (cands, n) = ordered_candidates(col, width as usize, 0, 0);
+    let (cands, n) = ordered_candidates(ctx, col, width as usize, 0, 0);
 
     for i in 0..n {
         let ci = cands[i] as usize;
         let r = (ci / 15) as i32;
         let c = (ci % 15) as i32;
         unsafe {
-            BOARD[ci] = col;
-            let win = is_winning_stone(&BOARD, r, c, col);
-            BOARD[ci] = 0;
+            ctx.BOARD[ci] = col;
+            let win = is_winning_stone(&ctx.BOARD, r, c, col);
+            ctx.BOARD[ci] = 0;
             if win {
-                RESULT_SCORE = MATE;
-                RESULT_DEPTH = 1;
-                RESULT_NODES = NODES as i32;
-                RESULT_TIMED_OUT = 0;
+                ctx.RESULT_SCORE = MATE;
+                ctx.RESULT_DEPTH = 1;
+                ctx.RESULT_NODES = ctx.NODES as i32;
+                ctx.RESULT_TIMED_OUT = 0;
                 return ci as i32;
             }
         }
@@ -1367,10 +1443,10 @@ pub extern "C" fn search_best_move(color: u32, max_depth: u32, time_ms: u32, wid
 
     if n == 0 {
         unsafe {
-            RESULT_SCORE = -MATE;
-            RESULT_DEPTH = 0;
-            RESULT_NODES = 0;
-            RESULT_TIMED_OUT = 0;
+            ctx.RESULT_SCORE = -MATE;
+            ctx.RESULT_DEPTH = 0;
+            ctx.RESULT_NODES = 0;
+            ctx.RESULT_TIMED_OUT = 0;
         }
         return -1;
     }
@@ -1382,7 +1458,7 @@ pub extern "C" fn search_best_move(color: u32, max_depth: u32, time_ms: u32, wid
     let mut depth = 2i32;
     while depth <= max_depth as i32 {
         unsafe {
-            if TIMED_OUT {
+            if ctx.TIMED_OUT {
                 break;
             }
         }
@@ -1396,11 +1472,11 @@ pub extern "C" fn search_best_move(color: u32, max_depth: u32, time_ms: u32, wid
         if best_score <= -(MATE - 200) {
             alpha = -MATE;
         }
-        let (m, s) = search_root(col, &cands, n, depth, alpha, beta);
+        let (m, s) = search_root(ctx, col, &cands, n, depth, alpha, beta);
         if s <= alpha || s >= beta {
-            let (m2, s2) = search_root(col, &cands, n, depth, -MATE, MATE);
+            let (m2, s2) = search_root(ctx, col, &cands, n, depth, -MATE, MATE);
             unsafe {
-                if !TIMED_OUT {
+                if !ctx.TIMED_OUT {
                     best_move = m2;
                     best_score = s2;
                     reached_depth = depth;
@@ -1408,7 +1484,7 @@ pub extern "C" fn search_best_move(color: u32, max_depth: u32, time_ms: u32, wid
             }
         } else {
             unsafe {
-                if !TIMED_OUT {
+                if !ctx.TIMED_OUT {
                     best_move = m;
                     best_score = s;
                     reached_depth = depth;
@@ -1425,10 +1501,10 @@ pub extern "C" fn search_best_move(color: u32, max_depth: u32, time_ms: u32, wid
     }
 
     unsafe {
-        RESULT_SCORE = best_score;
-        RESULT_DEPTH = reached_depth;
-        RESULT_NODES = NODES as i32;
-        RESULT_TIMED_OUT = if TIMED_OUT { 1 } else { 0 };
+        ctx.RESULT_SCORE = best_score;
+        ctx.RESULT_DEPTH = reached_depth;
+        ctx.RESULT_NODES = ctx.NODES as i32;
+        ctx.RESULT_TIMED_OUT = if ctx.TIMED_OUT { 1 } else { 0 };
     }
     best_move as i32
 }
@@ -1445,34 +1521,33 @@ pub extern "C" fn search_best_move_subset(
     width: u32,
     mask: u64,
 ) -> i32 {
+    let ctx = ts();
     let col = color as u8;
     unsafe {
-        NODES = 0;
-        TIMED_OUT = false;
-        MAX_PLY = 0;
-        DEADLINE = now() + time_ms as f64;
-        HASH = 0;
+        ctx.NODES = 0;
+        ctx.TIMED_OUT = false;
+        ctx.MAX_PLY = 0;
+        ctx.DEADLINE = now() + time_ms as f64;
+        ctx.HASH = 0;
         for i in 0..N {
-            HISTORY[i] = 0;
-            NEAR[i] = 0;
-            if BOARD[i] != 0 {
-                HASH ^= zobrist_at(i, BOARD[i]);
+            ctx.HISTORY[i] = 0;
+            ctx.NEAR[i] = 0;
+            if ctx.BOARD[i] != 0 {
+                ctx.HASH ^= zobrist_at(i, ctx.BOARD[i]);
                 let r = (i / 15) as i32;
                 let c = (i % 15) as i32;
-                near_delta(r, c, 1);
+                near_delta(ctx, r, c, 1);
             }
         }
-        EVAL_SCORE = evaluate(&BOARD);
-        build_five_tables();
-        for i in 0..TT_SIZE {
-            TT[i] = EMPTY_TT;
-        }
+        ctx.EVAL_SCORE = evaluate(&ctx.BOARD);
+        build_five_tables(ctx, );
+        tt_clear();
         for i in 0..64 {
-            KILLERS[i] = [0, 0];
+            ctx.KILLERS[i] = [0, 0];
         }
     }
 
-    let (cands, n) = ordered_candidates(col, width as usize, 0, 0);
+    let (cands, n) = ordered_candidates(ctx, col, width as usize, 0, 0);
 
     // 即胜检测（与主入口一致）：子集内的制胜点直接返回
     for i in 0..n {
@@ -1483,14 +1558,14 @@ pub extern "C" fn search_best_move_subset(
         let r = (ci / 15) as i32;
         let c = (ci % 15) as i32;
         unsafe {
-            BOARD[ci] = col;
-            let win = is_winning_stone(&BOARD, r, c, col);
-            BOARD[ci] = 0;
+            ctx.BOARD[ci] = col;
+            let win = is_winning_stone(&ctx.BOARD, r, c, col);
+            ctx.BOARD[ci] = 0;
             if win {
-                RESULT_SCORE = MATE;
-                RESULT_DEPTH = 1;
-                RESULT_NODES = NODES as i32;
-                RESULT_TIMED_OUT = 0;
+                ctx.RESULT_SCORE = MATE;
+                ctx.RESULT_DEPTH = 1;
+                ctx.RESULT_NODES = ctx.NODES as i32;
+                ctx.RESULT_TIMED_OUT = 0;
                 return ci as i32;
             }
         }
@@ -1507,10 +1582,10 @@ pub extern "C" fn search_best_move_subset(
     }
     if sn == 0 {
         unsafe {
-            RESULT_SCORE = -MATE;
-            RESULT_DEPTH = 0;
-            RESULT_NODES = 0;
-            RESULT_TIMED_OUT = 0;
+            ctx.RESULT_SCORE = -MATE;
+            ctx.RESULT_DEPTH = 0;
+            ctx.RESULT_NODES = 0;
+            ctx.RESULT_TIMED_OUT = 0;
         }
         return -1;
     }
@@ -1522,7 +1597,7 @@ pub extern "C" fn search_best_move_subset(
     let mut depth = 2i32;
     while depth <= max_depth as i32 {
         unsafe {
-            if TIMED_OUT {
+            if ctx.TIMED_OUT {
                 break;
             }
         }
@@ -1535,11 +1610,11 @@ pub extern "C" fn search_best_move_subset(
         if best_score <= -(MATE - 200) {
             alpha = -MATE;
         }
-        let (m, s) = search_root(col, &subset, sn, depth, alpha, beta);
+        let (m, s) = search_root(ctx, col, &subset, sn, depth, alpha, beta);
         if s <= alpha || s >= beta {
-            let (m2, s2) = search_root(col, &subset, sn, depth, -MATE, MATE);
+            let (m2, s2) = search_root(ctx, col, &subset, sn, depth, -MATE, MATE);
             unsafe {
-                if !TIMED_OUT {
+                if !ctx.TIMED_OUT {
                     best_move = m2;
                     best_score = s2;
                     reached_depth = depth;
@@ -1547,7 +1622,7 @@ pub extern "C" fn search_best_move_subset(
             }
         } else {
             unsafe {
-                if !TIMED_OUT {
+                if !ctx.TIMED_OUT {
                     best_move = m;
                     best_score = s;
                     reached_depth = depth;
@@ -1561,10 +1636,10 @@ pub extern "C" fn search_best_move_subset(
     }
 
     unsafe {
-        RESULT_SCORE = best_score;
-        RESULT_DEPTH = reached_depth;
-        RESULT_NODES = NODES as i32;
-        RESULT_TIMED_OUT = if TIMED_OUT { 1 } else { 0 };
+        ctx.RESULT_SCORE = best_score;
+        ctx.RESULT_DEPTH = reached_depth;
+        ctx.RESULT_NODES = ctx.NODES as i32;
+        ctx.RESULT_TIMED_OUT = if ctx.TIMED_OUT { 1 } else { 0 };
     }
     best_move as i32
 }
@@ -1575,45 +1650,45 @@ pub extern "C" fn search_best_move_subset(
 /// 用于并行搜索后对少数候选着法做统一全窗口精搜，消除各子集分数不可比的问题。
 #[no_mangle]
 pub extern "C" fn moves_buffer() -> *mut u16 {
-    unsafe { MOVES_BUF.as_mut_ptr() }
+    let ctx = ts();
+    unsafe { ctx.MOVES_BUF.as_mut_ptr() }
 }
 
 #[no_mangle]
 pub extern "C" fn search_moves(color: u32, max_depth: u32, time_ms: u32, n_moves: u32) -> i32 {
+    let ctx = ts();
     let col = color as u8;
     unsafe {
-        NODES = 0;
-        TIMED_OUT = false;
-        MAX_PLY = 0;
-        DEADLINE = now() + time_ms as f64;
-        HASH = 0;
+        ctx.NODES = 0;
+        ctx.TIMED_OUT = false;
+        ctx.MAX_PLY = 0;
+        ctx.DEADLINE = now() + time_ms as f64;
+        ctx.HASH = 0;
         for i in 0..N {
-            HISTORY[i] = 0;
-            NEAR[i] = 0;
-            if BOARD[i] != 0 {
-                HASH ^= zobrist_at(i, BOARD[i]);
+            ctx.HISTORY[i] = 0;
+            ctx.NEAR[i] = 0;
+            if ctx.BOARD[i] != 0 {
+                ctx.HASH ^= zobrist_at(i, ctx.BOARD[i]);
                 let r = (i / 15) as i32;
                 let c = (i % 15) as i32;
-                near_delta(r, c, 1);
+                near_delta(ctx, r, c, 1);
             }
         }
-        EVAL_SCORE = evaluate(&BOARD);
-        build_five_tables();
-        for i in 0..TT_SIZE {
-            TT[i] = EMPTY_TT;
-        }
+        ctx.EVAL_SCORE = evaluate(&ctx.BOARD);
+        build_five_tables(ctx, );
+        tt_clear();
         for i in 0..64 {
-            KILLERS[i] = [0, 0];
+            ctx.KILLERS[i] = [0, 0];
         }
     }
 
     let n = (n_moves as usize).min(64);
     if n == 0 {
         unsafe {
-            RESULT_SCORE = -MATE;
-            RESULT_DEPTH = 0;
-            RESULT_NODES = 0;
-            RESULT_TIMED_OUT = 0;
+            ctx.RESULT_SCORE = -MATE;
+            ctx.RESULT_DEPTH = 0;
+            ctx.RESULT_NODES = 0;
+            ctx.RESULT_TIMED_OUT = 0;
         }
         return -1;
     }
@@ -1621,7 +1696,7 @@ pub extern "C" fn search_moves(color: u32, max_depth: u32, time_ms: u32, n_moves
     let mut subset = [0u16; 64];
     unsafe {
         for i in 0..n {
-            subset[i] = MOVES_BUF[i];
+            subset[i] = ctx.MOVES_BUF[i];
         }
     }
 
@@ -1631,14 +1706,14 @@ pub extern "C" fn search_moves(color: u32, max_depth: u32, time_ms: u32, n_moves
         let r = (ci / 15) as i32;
         let c = (ci % 15) as i32;
         unsafe {
-            BOARD[ci] = col;
-            let win = is_winning_stone(&BOARD, r, c, col);
-            BOARD[ci] = 0;
+            ctx.BOARD[ci] = col;
+            let win = is_winning_stone(&ctx.BOARD, r, c, col);
+            ctx.BOARD[ci] = 0;
             if win {
-                RESULT_SCORE = MATE;
-                RESULT_DEPTH = 1;
-                RESULT_NODES = NODES as i32;
-                RESULT_TIMED_OUT = 0;
+                ctx.RESULT_SCORE = MATE;
+                ctx.RESULT_DEPTH = 1;
+                ctx.RESULT_NODES = ctx.NODES as i32;
+                ctx.RESULT_TIMED_OUT = 0;
                 return ci as i32;
             }
         }
@@ -1651,7 +1726,7 @@ pub extern "C" fn search_moves(color: u32, max_depth: u32, time_ms: u32, n_moves
     let mut depth = 2i32;
     while depth <= max_depth as i32 {
         unsafe {
-            if TIMED_OUT {
+            if ctx.TIMED_OUT {
                 break;
             }
         }
@@ -1664,11 +1739,11 @@ pub extern "C" fn search_moves(color: u32, max_depth: u32, time_ms: u32, n_moves
         if best_score <= -(MATE - 200) {
             alpha = -MATE;
         }
-        let (m, s) = search_root(col, &subset, n, depth, alpha, beta);
+        let (m, s) = search_root(ctx, col, &subset, n, depth, alpha, beta);
         if s <= alpha || s >= beta {
-            let (m2, s2) = search_root(col, &subset, n, depth, -MATE, MATE);
+            let (m2, s2) = search_root(ctx, col, &subset, n, depth, -MATE, MATE);
             unsafe {
-                if !TIMED_OUT {
+                if !ctx.TIMED_OUT {
                     best_move = m2;
                     best_score = s2;
                     reached_depth = depth;
@@ -1676,7 +1751,7 @@ pub extern "C" fn search_moves(color: u32, max_depth: u32, time_ms: u32, n_moves
             }
         } else {
             unsafe {
-                if !TIMED_OUT {
+                if !ctx.TIMED_OUT {
                     best_move = m;
                     best_score = s;
                     reached_depth = depth;
@@ -1690,10 +1765,160 @@ pub extern "C" fn search_moves(color: u32, max_depth: u32, time_ms: u32, n_moves
     }
 
     unsafe {
-        RESULT_SCORE = best_score;
-        RESULT_DEPTH = reached_depth;
-        RESULT_NODES = NODES as i32;
-        RESULT_TIMED_OUT = if TIMED_OUT { 1 } else { 0 };
+        ctx.RESULT_SCORE = best_score;
+        ctx.RESULT_DEPTH = reached_depth;
+        ctx.RESULT_NODES = ctx.NODES as i32;
+        ctx.RESULT_TIMED_OUT = if ctx.TIMED_OUT { 1 } else { 0 };
     }
     best_move as i32
+}
+
+// ---------------------------------------------------------------- Lazy SMP 入口
+
+/** 每实例全局：线程编号/总数/共享区基址与步长（mutable global → 每实例独立） */
+static mut MY_TID: u32 = 0;
+static mut MY_THREADS: u32 = 1;
+static mut MY_HEAP_BASE: u32 = 0;
+static mut MY_STRIDE: u32 = 0;
+/** 每线程栈区大小（字节）。JS 布局：state_t = heap + tid*stride；栈区 [state_t+state_size, +STACK)，__stack_pointer 置于栈区顶。 */
+const SMP_STACK_SIZE: u32 = 1024 * 1024;
+
+#[no_mangle]
+pub extern "C" fn smp_state_size() -> u32 {
+    core::mem::size_of::<ThreadState>() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn smp_stack_size() -> u32 {
+    SMP_STACK_SIZE
+}
+
+/// 每实例初始化：把本实例的线程状态区指到共享内存的专属分区。
+/// JS 侧须先设置 __stack_pointer（布局：heap + tid*stride + state_size + STACK），再调用本函数。
+#[no_mangle]
+pub extern "C" fn smp_init(tid: u32, threads: u32, heap_base: u32, stride: u32) {
+    unsafe {
+        // MY_* 位于共享内存：THREADS/HEAP/STRIDE 各线程写入同值无竞态；
+        // THREAD_BASE 只允许 tid=0（主线程/单线程路径）写入——helper 的状态区
+        // 由 smp_helper_run 的 tid 参数自行推导，避免共享覆盖。
+        MY_TID = tid;
+        MY_THREADS = threads;
+        MY_HEAP_BASE = heap_base;
+        MY_STRIDE = stride;
+        if tid == 0 {
+            THREAD_BASE = heap_base;
+        }
+    }
+}
+
+/// 主线程把 BOARD 广播到其他线程状态区（helpers 各自的 search_impl 前置会自行重算增量表）
+#[no_mangle]
+pub extern "C" fn smp_broadcast_board() {
+    unsafe {
+        let threads = MY_THREADS;
+        let heap = MY_HEAP_BASE;
+        let stride = MY_STRIDE;
+        let src = ts().BOARD;
+        for t in 1..threads {
+            let dst = (heap + t * stride) as *mut ThreadState;
+            (*dst).BOARD = src;
+        }
+    }
+}
+
+/// 主线程 SMP 搜索入口：广播局面 → 唤醒 helpers → 自身搜索 → 通知停止。
+/// 返回值/RESULT_* 与 search_best_move 同口径（主线程自己的状态）。
+#[no_mangle]
+pub extern "C" fn search_best_move_smp(color: u32, max_depth: u32, time_ms: u32, width: u32) -> i32 {
+    SMP_PARAMS[0].store(color, Ordering::Relaxed);
+    SMP_PARAMS[1].store(max_depth, Ordering::Relaxed);
+    SMP_PARAMS[2].store(time_ms, Ordering::Relaxed);
+    SMP_PARAMS[3].store(width, Ordering::Relaxed);
+    smp_broadcast_board();
+    SMP_STOP.store(false, Ordering::Release);
+    SMP_GO.store(true, Ordering::Release);
+    SMP_KEEP_TT.store(true, Ordering::Relaxed);
+    let r = search_best_move(color, max_depth, time_ms, width);
+    SMP_KEEP_TT.store(false, Ordering::Relaxed);
+    SMP_GO.store(false, Ordering::Release);
+    SMP_STOP.store(true, Ordering::Release);
+    r
+}
+
+/// helper 入口：自旋等待主线程唤醒（GO），按共享参数搜索（不清 TT），主线程 STOP 后自行中止。
+/// 返回本线程节点数（统计用）。搜索结果不导出——helper 的价值全部沉淀在共享 TT 里。
+#[no_mangle]
+pub extern "C" fn smp_helper_run(tid: u32) -> u32 {
+    // tid 参数显式传入（MY_TID 在共享内存不可靠）；状态区 = heap + tid*stride
+    let ctx: &mut ThreadState =
+        unsafe { &mut *((MY_HEAP_BASE + tid * MY_STRIDE) as *mut ThreadState) };
+    while !SMP_GO.load(Ordering::Acquire) {
+        // 自旋等待唤醒（等待窗口 = 主线程清 TT/广播的时间，毫秒级）
+    }
+    let color = SMP_PARAMS[0].load(Ordering::Acquire);
+    let max_depth = SMP_PARAMS[1].load(Ordering::Acquire);
+    let time_ms = SMP_PARAMS[2].load(Ordering::Acquire);
+    let width = SMP_PARAMS[3].load(Ordering::Acquire);
+    // 自身搜索（不广播、不清 TT；候选按 tid 轮转以错开搜索树）
+    unsafe {
+        ctx.NODES = 0;
+        ctx.TIMED_OUT = false;
+        ctx.MAX_PLY = 0;
+        ctx.DEADLINE = now() + time_ms as f64;
+        ctx.HASH = 0;
+        for i in 0..N {
+            ctx.HISTORY[i] = 0;
+            ctx.NEAR[i] = 0;
+            if ctx.BOARD[i] != 0 {
+                ctx.HASH ^= zobrist_at(i, ctx.BOARD[i]);
+                let r = (i / 15) as i32;
+                let c = (i % 15) as i32;
+                near_delta(ctx, r, c, 1);
+            }
+        }
+        ctx.EVAL_SCORE = evaluate(&ctx.BOARD);
+        build_five_tables(ctx, );
+        for i in 0..64 {
+            ctx.KILLERS[i] = [0, 0];
+        }
+    }
+    let col = color as u8;
+    let mut best_score = -INF;
+    let mut depth = 2i32;
+    while depth <= max_depth as i32 {
+        unsafe {
+            if ctx.TIMED_OUT || SMP_STOP.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        let mut alpha = -MATE;
+        let mut beta = MATE;
+        if depth > 2 && best_score > -MATE / 2 && best_score < MATE / 2 {
+            alpha = best_score - 200;
+            beta = best_score + 200;
+        }
+        if best_score <= -(MATE - 200) {
+            alpha = -MATE;
+        }
+        let (mut c, n2) = ordered_candidates(ctx, col, width as usize, 0, 0);
+        if n2 == 0 {
+            break;
+        }
+        // tid 轮转根候选序：错开各 helper 的搜索树（主线程 tid=0 不轮转）
+        let rot = (tid as usize) % n2;
+        if rot > 0 {
+            c.rotate_left(rot);
+        }
+        let (_m, s) = search_root(ctx, col, &c, n2, depth, alpha, beta);
+        unsafe {
+            if !ctx.TIMED_OUT {
+                best_score = s;
+            }
+        }
+        depth += 2;
+        if best_score >= MATE - 200 || best_score <= -(MATE - 200) {
+            break;
+        }
+    }
+    unsafe { ctx.NODES }
 }
